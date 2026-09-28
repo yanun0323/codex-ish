@@ -1,0 +1,41 @@
+{
+  "name": "pi-codex-ish",
+  "version": "0.1.0",
+  "description": "Codex-style Pi extension: subscription web search, Codex image generation, usage-aware statusline footer, ChatGPT Remote Control, skill mentions, side conversations, and editor tweaks.",
+  "type": "module",
+  "license": "MIT",
+  "author": "yanun0323",
+  "homepage": "https://github.com/yanun0323/codex-ish#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yanun0323/codex-ish.git"
+  },
+  "bugs": {
+    "url": "https://github.com/yanun0323/codex-ish/issues"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "codex",
+    "chatgpt",
+    "web-search",
+    "image-generation",
+    "remote-control"
+  ],
+  "files": [
+    "extensions",
+    "README.md",
+    "LICENSE"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "dependencies": {
+    "pi-codex-app-server": "^0.1.1",
+    "qrcode": "^1.5.4"
+  }
+}
