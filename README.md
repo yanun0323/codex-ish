@@ -1,5 +1,13 @@
 # pi-codex-ish
 
+<p align="center">
+  <a href="README.md"><img src="https://img.shields.io/badge/English-Click-yellow" alt="English"></a>
+  <a href="README-tw.md"><img src="https://img.shields.io/badge/繁體中文-點擊查看-orange" alt="繁體中文"></a>
+  <a href="README-cn.md"><img src="https://img.shields.io/badge/简体中文-点击查看-orange" alt="简体中文"></a>
+  <a href="README-ja.md"><img src="https://img.shields.io/badge/日本語-クリック-blue" alt="日本語"></a>
+  <a href="README-ko.md"><img src="https://img.shields.io/badge/한국어-클릭-yellow" alt="한국어"></a>
+</p>
+
 A [Pi Coding Agent](https://github.com/earendil-works/pi) extension that brings the OpenAI Codex / ChatGPT subscription experience into Pi: subscription web search, Codex image generation, a usage-aware statusline, ChatGPT Remote Control, skill mentions, side conversations, and Codex-style editor behavior.
 
 ## Install
