@@ -6,8 +6,6 @@ A [Pi Coding Agent](https://github.com/earendil-works/pi) extension that brings 
 
 ```bash
 pi install git:github.com/yanun0323/codex-ish
-# or, once published to npm:
-pi install npm:pi-codex-ish
 ```
 
 Restart Pi after installing. Requirements:
