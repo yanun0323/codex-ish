@@ -26,9 +26,11 @@ pi install git:github.com/yanun0323/codex-ish
 
 ### 웹 검색 도구 (`web_search`)
 
-- **OpenAI Codex 모델**: Codex 구독의 네이티브 웹 검색을 사용합니다. 답변과 인용한 출처 URL을 반환하며, 현재 thinking level을 따릅니다.
-- **그 외 모든 모델**: 무료 DuckDuckGo HTML 검색으로 대체됩니다 — 로그인이나 API key가 필요 없습니다. 최대 10개의 제목, 발췌문, URL을 반환합니다 (연결된 페이지 자체는 읽지 않습니다).
-- 대화 기록은 전송하지 않습니다. 자동 재시도나 두 백엔드 간 대체도 없습니다. 선택적인 `urls`는 Codex가 확인하고, DuckDuckGo에서는 `site:` 필터로 사용합니다.
+- **OpenAI Codex Responses 모델**: 현재 대화의 모델이 네이티브 웹 검색을 직접 사용합니다. 별도의 GPT 요청을 보내지 않으며 확장 기능의 2분 제한도 없습니다. 메인 대화의 내용, 구독 로그인, thinking level, 빠른 모드 설정을 사용하고 취소, 사용량, 시간 제한, 연결 재시도는 Pi의 provider가 관리합니다.
+- **그 외 모든 provider**: 무료 DuckDuckGo HTML 검색을 사용합니다. 로그인이나 API key가 필요 없습니다. 최대 10개의 제목, 발췌문, URL을 반환하며 페이지 자체는 읽지 않습니다. 시간 제한은 30초, 출력 한도는 24 KB입니다. 대화 기록은 DuckDuckGo에 전송하지 않으며 선택적인 `urls`는 호스트 이름의 `site:` 필터로 사용합니다. 자동 재시도는 없습니다.
+- `web_search`가 활성화된 경우에만 검색을 제공합니다. 확장 기능은 모델을 바꾸거나 검색 백엔드 간에 전환하지 않습니다. 다른 API를 사용하는 Codex 모델은 Codex Responses 모델로 바꿔야 합니다.
+- **현재 Pi의 제한**: 네이티브 검색 이벤트와 구조화된 인용 정보는 도구 결과로 보존되지 않습니다. 답변에 실제 출처 링크를 넣도록 모델에 지시하지만 인용 표시를 보장하지는 않습니다. 별도의 검색 진행 카드나 구조화된 출처 목록은 없습니다.
+- 업데이트 후 `/reload`를 실행하거나 Pi를 재시작해 새 검색 방식을 불러오세요.
 
 ### Codex 이미지 생성 (`codex_generate_image`, `codex_image_job`, `view_image`)
 

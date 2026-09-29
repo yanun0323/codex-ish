@@ -26,9 +26,11 @@ pi install git:github.com/yanun0323/codex-ish
 
 ### 網頁搜尋工具（`web_search`）
 
-- **OpenAI Codex 模型**：使用 Codex 訂閱的原生網頁搜尋。回傳答案與引用的來源 URL，並跟隨目前的思考等級（thinking level）。
-- **其他所有模型**：退回免費的 DuckDuckGo HTML 搜尋——不需要登入或 API key。最多回傳 10 筆標題、摘要與 URL（不會讀取網頁內容本身）。
-- 不會送出對話歷史。不會自動重試，也不會在兩個後端之間退回。選擇性的 `urls` 會交給 Codex 檢視，或作為 DuckDuckGo 的 `site:` 篩選條件。
+- **OpenAI Codex Responses 模型**：由目前對話的模型直接使用原生網頁搜尋。不再另發一個 GPT 請求，也不再受擴充套件的兩分鐘期限限制。搜尋沿用主對話的內容、訂閱登入、思考等級與快速模式；取消、用量、逾時和連線重試由 Pi 的 provider 處理。
+- **其他所有 provider**：使用免費的 DuckDuckGo HTML 搜尋——不需要登入或 API key。最多回傳 10 筆標題、摘要與 URL（不會讀取網頁內容本身），期限為 30 秒，輸出上限為 24 KB。不會把對話歷史傳給 DuckDuckGo；選擇性的 `urls` 會轉成網域的 `site:` 篩選條件。不會自動重試。
+- 只有啟用 `web_search` 時才提供搜尋。擴充套件不會切換模型，也不會在搜尋後端之間退回。使用其他 API 的 Codex 模型需改選 Codex Responses 模型。
+- **目前 Pi 的限制**：原生搜尋事件與結構化引用標記不會保留為工具結果。我們會指示模型在答案中直接附上來源連結，但不保證引用一定正確顯示。目前沒有獨立的搜尋進度卡片或結構化來源清單。
+- 更新後請執行 `/reload` 或重新啟動 Pi，載入新的搜尋方式。
 
 ### Codex 圖片生成（`codex_generate_image`、`codex_image_job`、`view_image`）
 

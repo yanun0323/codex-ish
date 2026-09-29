@@ -26,9 +26,11 @@ Restart Pi after installing. Requirements:
 
 ### Web search tool (`web_search`)
 
-- **OpenAI Codex models**: uses your Codex subscription's native web search. Returns an answer plus cited source URLs, and follows your current thinking level.
-- **Every other model**: falls back to free DuckDuckGo HTML search — no login or API key. Returns up to 10 titles, snippets, and URLs (pages themselves are not read).
-- Conversation history is never sent. No automatic retries or backend fallbacks. Optional `urls` are examined by Codex, or used as `site:` filters on DuckDuckGo.
+- **OpenAI Codex Responses models**: the current conversation model uses native web search directly. No second GPT request and no extension-imposed two-minute deadline. Search uses the main conversation context, subscription login, thinking level, and fast-mode setting; cancellation, usage, timeouts, and transport retries are managed by Pi's provider.
+- **Every other provider**: uses free DuckDuckGo HTML search — no login or API key. Returns up to 10 titles, snippets, and URLs (pages themselves are not read), with a 30-second timeout and 24 KB output limit. Conversation history is not sent to DuckDuckGo; optional `urls` become hostname `site:` filters. No automatic retries.
+- Search is enabled only when `web_search` is active. The extension does not switch models or fall back between search backends. Codex models using a different API must switch to a Codex Responses model.
+- **Current Pi limitation**: native search events and structured citation annotations are not retained as tool results. The model is instructed to include explicit source links in its answer, but this is not a citation-rendering guarantee. There is no separate search-progress card or structured source list.
+- After updating, use `/reload` or restart Pi to load the new search behavior.
 
 ### Codex image generation (`codex_generate_image`, `codex_image_job`, `view_image`)
 

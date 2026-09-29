@@ -24,7 +24,7 @@ const jiti = createJiti(import.meta.url, {
   },
 });
 const extension = await jiti.import(resolve(here, "..", "extensions", "codex-ish.ts"));
-const { parseDuckDuckGoResults, searchDuckDuckGo, searchBody } = extension;
+const { parseDuckDuckGoResults, searchDuckDuckGo, withNativeWebSearch } = extension;
 const signal = () => new AbortController().signal;
 const htmlResponse = (html) => new Response(html, { headers: { "content-type": "text/html; charset=UTF-8" } });
 
@@ -59,32 +59,6 @@ function setup(provider = "deepseek", api = "openai-completions") {
     },
   };
   return { tool: tools.get("web_search"), handlers, ctx };
-}
-
-function codexAuth() {
-  const claims = {
-    exp: Math.floor(Date.now() / 1000) + 3600,
-    "https://api.openai.com/auth": { chatgpt_account_id: "test-account" },
-  };
-  const token = `test.${Buffer.from(JSON.stringify(claims)).toString("base64url")}.test`;
-  return { ok: true, apiKey: token };
-}
-
-function codexResponse(withSearch = true) {
-  return new Response(`data: ${JSON.stringify({
-    type: "response.completed",
-    response: {
-      status: "completed",
-      output: [
-        ...(withSearch ? [{
-          type: "web_search_call", id: "search-1", status: "completed",
-          action: { query: "test", sources: [{ title: "Example", url: "https://example.com/" }] },
-        }] : []),
-        { type: "message", content: [{ type: "output_text", text: "A sourced answer.", annotations: [] }] },
-      ],
-      usage: { input_tokens: 100, input_tokens_details: { cached_tokens: 20 }, output_tokens: 10 },
-    },
-  })}\n\n`, { headers: { "content-type": "text/event-stream" } });
 }
 
 test("DDG parser unwraps links, decodes entities and finds nested snippets", () => {
@@ -193,53 +167,131 @@ test("all non-Codex providers route to DDG without reading credentials", async (
   assert.equal(mock.mock.callCount(), 6);
 });
 
-test("Codex retains subscription search, current model, native search verification and usage", async (t) => {
-  const { tool, ctx } = setup("openai-codex", "openai-codex-responses");
-  ctx.modelRegistry.getApiKeyAndHeaders = async (model) => {
-    assert.equal(model, ctx.model);
-    return codexAuth();
+test("native search replaces only the local search tool and preserves the main request", () => {
+  const payload = {
+    model: "test-model", instructions: "Original instructions",
+    input: [{ role: "user", content: "Existing conversation" }],
+    tools: [
+      { type: "function", name: "read", parameters: {} },
+      { type: "function", name: "web_search", parameters: {} },
+    ],
+    tool_choice: "auto", reasoning: { effort: "high" },
+    include: ["reasoning.encrypted_content"], stream: true, store: false,
   };
-  const mock = t.mock.method(globalThis, "fetch", async (url, init) => {
-    assert.equal(url, extension.SEARCH_ENDPOINT);
-    const body = JSON.parse(init.body);
-    assert.equal(body.model, ctx.model.id);
-    assert.equal(body.tools[0].type, "web_search");
-    assert.equal(body.tool_choice, "required");
-    assert.equal(new Headers(init.headers).get("ChatGPT-Account-ID"), "test-account");
-    return codexResponse();
+  const original = structuredClone(payload);
+  const result = withNativeWebSearch(payload);
+  assert.deepEqual(result.tools, [payload.tools[0], { type: "web_search" }]);
+  assert.match(result.instructions, /^Original instructions/);
+  assert.match(result.instructions, /explicit Markdown links/);
+  for (const key of ["input", "model", "reasoning", "include", "tool_choice", "stream", "store"]) {
+    assert.equal(result[key], payload[key]);
+  }
+  assert.deepEqual(payload, original);
+  assert.deepEqual(withNativeWebSearch(result), result);
+});
+
+test("native search updates a forced search choice but preserves other choices", () => {
+  const tools = [{ type: "function", name: "web_search" }];
+  assert.deepEqual(withNativeWebSearch({ tools, tool_choice: { type: "function", name: "web_search" } }).tool_choice, { type: "web_search" });
+  for (const choice of ["auto", "none", "required", { type: "function", name: "read" }]) {
+    assert.equal(withNativeWebSearch({ tools, tool_choice: choice }).tool_choice, choice);
+  }
+});
+
+test("native search handles namespaces without removing unrelated tools", () => {
+  const payload = { tools: [
+    { type: "namespace", name: "functions", tools: [
+      { type: "function", name: "web_search" }, { type: "function", name: "bash" },
+    ] },
+    { type: "namespace", name: "search_only", tools: [{ type: "function", name: "web_search" }] },
+  ] };
+  assert.deepEqual(withNativeWebSearch(payload).tools, [
+    { type: "namespace", name: "functions", tools: [{ type: "function", name: "bash" }] },
+    { type: "web_search" },
+  ]);
+});
+
+test("native search respects disabled tools and does not duplicate an existing native declaration", () => {
+  for (const payload of [{}, { tools: [] }, { tools: [{ type: "function", name: "read" }] }]) {
+    assert.equal(withNativeWebSearch(payload), payload);
+  }
+  const native = { type: "web_search", search_context_size: "low" };
+  const result = withNativeWebSearch({ tools: [native, { type: "function", name: "web_search" }] });
+  assert.deepEqual(result.tools, [native]);
+});
+
+test("request hook enables native search only for Codex Responses and composes with fast mode", async (t) => {
+  t.mock.method(globalThis, "fetch", () => assert.fail("No separate request"));
+  for (const [provider, api, native] of [
+    ["openai-codex", "openai-codex-responses", true],
+    ["openai-codex", "openai-completions", false],
+    ["openai", "openai-responses", false],
+    ["deepseek", "openai-completions", false],
+  ]) {
+    const { ctx, handlers } = setup(provider, api);
+    let payload = { instructions: "Keep", tools: [{ type: "function", name: "web_search" }] };
+    for (const handler of handlers.get("before_provider_request")) {
+      payload = await handler({ payload }, ctx) ?? payload;
+    }
+    assert.equal(payload.tools[0].type, native ? "web_search" : "function");
+    if (native) assert.equal(payload.service_tier, "default");
+  }
+});
+
+test("stale Codex function calls fail without credentials, a nested request, or DDG fallback", async (t) => {
+  t.mock.method(globalThis, "fetch", () => assert.fail("Must not fetch"));
+  const codex = setup("openai-codex", "openai-codex-responses");
+  await assert.rejects(codex.tool.execute("test", { query: "test" }, signal(), undefined, codex.ctx), /Use the native web_search/);
+  const badApi = setup("openai-codex");
+  await assert.rejects(badApi.tool.execute("test", { query: "test" }, signal(), undefined, badApi.ctx), /requires a Codex Responses model/);
+});
+
+test("Pi's Codex stream accepts native search, retains URL text and accounts main-turn usage", async () => {
+  const { stream } = await import("@earendil-works/pi-ai/api/openai-codex-responses");
+  const { ctx, handlers } = setup("openai-codex", "openai-codex-responses");
+  const text = "See [the source](https://example.com/docs).";
+  const searchItem = { type: "web_search_call", id: "ws_1", status: "completed", action: { type: "search", query: "docs" } };
+  const messageItem = { type: "message", id: "msg_1", role: "assistant", status: "completed", content: [{ type: "output_text", text, annotations: [{ type: "url_citation", url: "https://example.com/docs", title: "Source", start_index: 0, end_index: text.length }] }] };
+  const events = [
+    { type: "response.created", response: { id: "resp_1" } },
+    { type: "response.output_item.added", output_index: 0, item: { ...searchItem, status: "in_progress" } },
+    { type: "response.web_search_call.searching", output_index: 0, item_id: "ws_1" },
+    { type: "response.output_item.done", output_index: 0, item: searchItem },
+    { type: "response.output_item.added", output_index: 1, item: { ...messageItem, content: [] } },
+    { type: "response.output_text.delta", output_index: 1, content_index: 0, delta: text },
+    { type: "response.output_item.done", output_index: 1, item: messageItem },
+    { type: "response.completed", response: { id: "resp_1", status: "completed", output: [searchItem, messageItem], usage: { input_tokens: 100, input_tokens_details: { cached_tokens: 20 }, output_tokens: 10, total_tokens: 110 } } },
+  ];
+  const claims = Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "test-account" } })).toString("base64url");
+  let requests = 0;
+  let sent;
+  const response = stream({ ...ctx.model, input: ["text"], contextWindow: 10000, maxTokens: 1000 }, {
+    messages: [
+      { role: "system", content: "Original instructions", timestamp: 0, toolsAdded: [{ name: "web_search", description: "Search", parameters: { type: "object", properties: {} } }] },
+      { role: "user", content: "Find docs", timestamp: 1 },
+    ],
+  }, {
+    apiKey: `test.${claims}.test`, transport: "sse", maxRetries: 0,
+    onPayload: async (body) => {
+      for (const handler of handlers.get("before_provider_request")) body = await handler({ payload: body }, ctx) ?? body;
+      sent = body;
+      return body;
+    },
+    fetch: async () => {
+      requests++;
+      return new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), { headers: { "content-type": "text/event-stream" } });
+    },
   });
-  const result = await tool.execute("test", { query: "test" }, signal(), undefined, ctx);
-  assert.equal(result.details.backend, "codex");
-  assert.equal(result.details.searches, 1);
-  assert.match(result.content[0].text, /A sourced answer/);
+  const result = await response.result();
+  assert.equal(requests, 1);
+  assert.deepEqual(sent.tools, [{ type: "web_search" }]);
+  assert.match(JSON.stringify(sent.input), /Find docs/);
+  assert.equal(result.stopReason, "stop", result.errorMessage);
+  assert.equal(result.content.find((block) => block.type === "text").text, text);
+  assert.equal(result.content.some((block) => block.type === "toolCall"), false);
   assert.equal(result.usage.input, 80);
   assert.equal(result.usage.cacheRead, 20);
   assert.equal(result.usage.output, 10);
-  assert.equal(mock.mock.callCount(), 1);
-  assert.equal(searchBody("test-model", "test", [], "high").reasoning.effort, "high");
-});
-
-test("Codex failures and missing native search never fall back to DDG", async (t) => {
-  const { tool, ctx } = setup("openai-codex", "openai-codex-responses");
-  ctx.modelRegistry.getApiKeyAndHeaders = async () => codexAuth();
-  let emptySearch = false;
-  const mock = t.mock.method(globalThis, "fetch", async (url) => {
-    assert.equal(url, extension.SEARCH_ENDPOINT);
-    return emptySearch ? codexResponse(false) : new Response("limited", { status: 429 });
-  });
-  await assert.rejects(tool.execute("test", { query: "test" }, signal(), undefined, ctx), /HTTP 429/);
-  emptySearch = true;
-  await assert.rejects(tool.execute("test", { query: "test" }, signal(), undefined, ctx), /no completed web search/);
-  assert.equal(mock.mock.callCount(), 2);
-});
-
-test("Codex rejects unsupported API and custom proxy without any request", async (t) => {
-  t.mock.method(globalThis, "fetch", () => assert.fail("Must not fetch"));
-  const badApi = setup("openai-codex");
-  await assert.rejects(badApi.tool.execute("test", { query: "test" }, signal(), undefined, badApi.ctx), /does not support subscription/);
-  const proxy = setup("openai-codex", "openai-codex-responses");
-  proxy.ctx.model.baseUrl = "https://proxy.example.com/v1";
-  await assert.rejects(proxy.tool.execute("test", { query: "test" }, signal(), undefined, proxy.ctx), /Custom proxies are not supported/);
 });
 
 test("DDG tool errors hide network details and do not use Codex", async (t) => {
