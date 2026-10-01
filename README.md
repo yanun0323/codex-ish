@@ -74,7 +74,7 @@ Type `$` in the editor to autocomplete installed skills. A message mentioning `$
 
 ### Side conversations (`/btw` or `/side`)
 
-Opens an ephemeral side chat that inherits the main conversation as read-only reference. Ask questions without disrupting or continuing the main thread; the side agent is instructed never to modify anything. Ctrl+C to close, PgUp/PgDn to scroll.
+Opens an in-memory, read-only side chat using the main conversation as reference. Only Pi's built-in `read`, `grep`, `find`, and `ls` tools are available; Side runs lookups and returns their results to the model before answering. Shell commands, file-changing tools, and extension tools are not exposed. Each question allows up to 8 model requests and 24 tool calls. Requires TUI mode. Side opens in a full-window overlay so its scrolling does not move the main conversation. PgUp/PgDn scroll; ↑/↓ scroll when the input is empty. Fullscreen mode also supports the mouse wheel and trackpad; regular mode uses keyboard scrolling. Esc or Ctrl+C closes the overlay and cancels pending work; branch changes and session shutdown also cancel it.
 
 ### Editor behavior
 
@@ -108,7 +108,7 @@ Git installs compile the Remote host through `prepare`. For a source checkout, r
 - Search, image generation, and Remote Control call OpenAI's **ChatGPT backend API** with your subscription login — these are the same endpoints the official Codex client uses, but they are not publicly documented APIs and may change.
 - Image generation consumes your Codex usage quota. Cancelling a job only stops local waiting; the request may still complete server-side and count toward usage. Failed jobs are never retried automatically.
 - Web content returned by search is untrusted data, not instructions.
-- Interactive (TUI) or RPC sessions are required for background image jobs and the side-conversation overlay.
+- Background image jobs require interactive (TUI) or RPC sessions. Side conversations require TUI mode.
 
 ## License
 
