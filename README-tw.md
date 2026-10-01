@@ -18,8 +18,8 @@ pi install git:github.com/yanun0323/codex-ish
 
 安裝後請重新啟動 Pi。需求：
 
-- Pi Coding Agent（擴充套件會匯入 Pi 自己的套件，由 Pi 提供）。
-- Node.js 22.5+（使用內建的 `node:sqlite`）。
+- Pi Coding Agent 0.87.1+（Remote 使用主機上的 Pi SDK）。
+- Node.js 22.19+（使用內建的 `node:sqlite`）。Remote 目前支援 macOS 與 Linux。
 - 若要使用搜尋、圖片生成與 Remote Control，需要 OpenAI Codex 登入（`/login` → OpenAI Codex）。DuckDuckGo 搜尋與狀態列不需要登入也能使用。
 
 ## 功能
@@ -49,15 +49,19 @@ pi install git:github.com/yanun0323/codex-ish
 
 ### ChatGPT Remote Control（`/remote`）
 
-用 ChatGPT 手機 App 控制這台 Pi 主機：
+**實驗功能：**內建 Remote 主機，讓手機與 Mac 的 Codex 用戶端共用 Pi 對話。已用模擬用戶端與 Pi SDK 測試；真正的 App 配對與相容性尚未驗證。
 
 ```
 /remote status | start | stop | pair | devices | revoke CLIENT_ID
 ```
 
-- `/remote pair` 會顯示可用 ChatGPT 掃描的 QR code，並提供手動配對碼。
-- 執行本機 `pi-codex-app-server` daemon（工作階段開始時自動啟動；設定 `PI_CODEX_APP_SERVER_AUTOSTART=0` 可停用）。
-- 別名（舊版）：`/codex-server`。
+- `/remote pair` 會先詢問確認，再顯示 QR code 與手動配對碼。兩台裝置配對同一台主機、開啟同一個對話。仍需要 OpenAI 的轉接服務，以及 Pi 的 ChatGPT 訂閱登入。
+- 每個對話只有一個 Pi 執行程序。兩邊收到相同的訊息與更新；工作進行中送出的訊息會排入後續訊息。終端機對話仍由原本的 Pi 執行，斷線不會另開第二個程序；請在 Pi 重新開啟該對話以連回。遠端建立的對話則由背景 Pi 程序執行。
+- 提供家目錄瀏覽、建立資料夾與共用專案。只有本機 Pi 可以登記家目錄以外的專案。檔案瀏覽器會隱藏已知的憑證位置，但**這不是沙箱**：已配對的裝置能以主機使用者的權限操作 Pi 工具。請只配對信任的裝置。
+- 使用內建背景服務與需要驗證的私人 Unix socket，不再需要 `pi-codex-app-server` 或 `codex` 執行檔。Pi 工作階段開始時會啟動本機服務，除非設定 `PI_CODEX_APP_SERVER_AUTOSTART=0`；首次連接轉接服務需執行 `/remote start` 或 `/remote pair`。啟用後，主機重新啟動會自動連回。`/remote stop` 會停用並停止服務，但不會停止終端機中的 Pi 工作。
+- 使用獨立的狀態目錄。若舊服務仍在執行，請先 `/remote stop`，再 `/remote pair`；不會搬移或刪除舊資料與配對。主機綁定原本的 ChatGPT 帳號。若要退回舊版，先停止新服務，再安裝先前版本；舊版資料仍保留。
+- 只實作部分 Codex App Server 功能。不支援的方法、設定覆寫、沙箱或審核政策會明確回報錯誤。進行中的終端機工作不會移交給背景程序。終端機重新連線或切換分支後，請重新讀取對話；不要盲目重送執行狀態不明的工作。`/remote status` 會顯示最後一個不支援的 App 請求。
+- 舊版別名：`/codex-server`。協定測試固定使用 Codex commit `444da310e108da16aaeb18fd790b0ac464f08aca`。
 
 ### 快速模式（`/fast`）
 
@@ -83,17 +87,20 @@ pi install git:github.com/yanun0323/codex-ish
 | 設定 | 位置 | 說明 |
 |---|---|---|
 | 快速模式 | `~/.pi/agent/codex-ish.json` | 由 `/fast` 寫入 |
-| Remote daemon 主目錄 | `~/.pi/agent/codex-app-server/` | 可用 `PI_CODEX_APP_SERVER_HOME` 覆寫 |
+| Remote 服務目錄 | `~/.pi/agent/codex-ish-remote/` | 可用 `PI_CODEX_ISH_REMOTE_HOME` 覆寫；請保持目錄私密 |
 | Remote 自動啟動 | 環境變數 | `PI_CODEX_APP_SERVER_AUTOSTART=0` 停用 |
-| Remote 監聽位址 | 環境變數 | `PI_CODEX_APP_SERVER_LISTEN`（預設 `ws://127.0.0.1:0`） |
+| Remote 本機連線 | Remote 目錄內的 `host.sock` | 私人 Unix socket；不再使用 `PI_CODEX_APP_SERVER_LISTEN` |
+| Remote 主機名稱 | 環境變數 | `PI_CODEX_APP_SERVER_HOST_NAME` |
 | 關閉 Remote control | 環境變數 | `PI_CODEX_REMOTE_CONTROL=0` |
 
 ## 相依套件
 
-- `pi-codex-app-server` — Remote Control daemon（npm）。
+- `ws` — 內建 Remote 主機的 WebSocket 連線（npm）。
 - `qrcode` — 配對用的終端機 QR code（npm）。
 
 Pi 套件（`@earendil-works/pi-ai`、`pi-coding-agent`、`pi-tui`、`typebox`）宣告為 peer dependencies，由 Pi 本身提供。
+
+透過 Git 安裝時，`prepare` 會編譯 Remote 主機。使用原始碼開發時，請執行 `npm ci`、`npm run check` 與 `npm test`；`npm pack --dry-run` 可檢查是否包含 `dist/remote`。測試使用臨時目錄、假憑證與本機伺服器，不會配對真實裝置或呼叫付費模型。
 
 ## 注意事項
 
@@ -104,4 +111,4 @@ Pi 套件（`@earendil-works/pi-ai`、`pi-coding-agent`、`pi-tui`、`typebox`�
 
 ## 授權
 
-MIT
+MIT。`tests/fixtures/codex/` 的上游協定測試資料保留原有的 Apache-2.0 授權與聲明。

@@ -18,8 +18,8 @@ pi install git:github.com/yanun0323/codex-ish
 
 Restart Pi after installing. Requirements:
 
-- Pi Coding Agent (the extension imports Pi's own packages, which Pi provides).
-- Node.js 22.5+ (uses the built-in `node:sqlite`).
+- Pi Coding Agent 0.87.1+ (Remote uses the host's Pi SDK).
+- Node.js 22.19+ (uses the built-in `node:sqlite`). Remote currently supports macOS and Linux.
 - An OpenAI Codex login (`/login` → OpenAI Codex) for search, image generation, and Remote Control. DuckDuckGo search and the statusline work without it.
 
 ## Features
@@ -49,15 +49,19 @@ Custom footer with model, provider, remote-control state, context usage, and liv
 
 ### ChatGPT Remote Control (`/remote`)
 
-Control this Pi host from the ChatGPT mobile app:
+**Experimental:** a built-in host for sharing Pi conversations between mobile and Mac Codex clients. Automated clients and the Pi SDK are tested; real App pairing and compatibility are not yet verified.
 
 ```
 /remote status | start | stop | pair | devices | revoke CLIENT_ID
 ```
 
-- `/remote pair` shows a QR code to scan with ChatGPT, plus a manual pairing code.
-- Runs a local `pi-codex-app-server` daemon (auto-starts on session start; set `PI_CODEX_APP_SERVER_AUTOSTART=0` to disable).
-- Legacy alias: `/codex-server`.
+- `/remote pair` asks for confirmation, then shows a QR code and manual code. Pair both devices with this host and open the same conversation. The OpenAI relay and a ChatGPT-backed Pi login are still required.
+- Each conversation has one Pi execution owner. Both clients receive the same messages and updates; messages sent during work become follow-ups. A connected terminal stays the owner. Losing that connection never starts a second writer; reopen the session in Pi to reconnect it. Remotely created conversations use background Pi workers.
+- Provides home-directory browsing, folder creation, and shared projects. Only local Pi registration can share a project outside home. Known credential locations are hidden by the file browser, **not sandboxed**: paired devices can use Pi tools with the host user's permissions. Pair only trusted devices.
+- Uses its own background process and an authenticated private Unix socket. No `pi-codex-app-server` package or `codex` executable is needed. Session startup starts the local host unless `PI_CODEX_APP_SERVER_AUTOSTART=0`; first-time relay access requires `/remote start` or `/remote pair`. An enabled host reconnects after restart. `/remote stop` disables and stops it without stopping terminal Pi work.
+- Uses a separate state directory. If the old daemon is running, use `/remote stop`, then `/remote pair`; old data and grants are not migrated or deleted. The host remains bound to its original ChatGPT account. To roll back, stop the new host and reinstall the prior package; its old state is untouched.
+- Only part of the Codex App Server API is implemented. Unsupported methods, configuration overrides, and sandbox/approval policies return errors. Running terminal work is not transferred to a background worker. After a terminal reconnect or branch change, reread the conversation; never blindly resend uncertain work. Check `/remote status` for the last unsupported App method.
+- Legacy alias: `/codex-server`. Protocol tests use Codex commit `444da310e108da16aaeb18fd790b0ac464f08aca`.
 
 ### Fast mode (`/fast`)
 
@@ -83,17 +87,20 @@ Opens an ephemeral side chat that inherits the main conversation as read-only re
 | Setting | Location | Notes |
 |---|---|---|
 | Fast mode | `~/.pi/agent/codex-ish.json` | Written by `/fast` |
-| Remote daemon home | `~/.pi/agent/codex-app-server/` | Override with `PI_CODEX_APP_SERVER_HOME` |
+| Remote daemon home | `~/.pi/agent/codex-ish-remote/` | Override with `PI_CODEX_ISH_REMOTE_HOME`; keep this directory private |
 | Remote autostart | env | `PI_CODEX_APP_SERVER_AUTOSTART=0` disables |
-| Remote listen address | env | `PI_CODEX_APP_SERVER_LISTEN` (default `ws://127.0.0.1:0`) |
+| Remote local connection | `host.sock` inside the Remote home | Private Unix socket; `PI_CODEX_APP_SERVER_LISTEN` is no longer used |
+| Remote host name | env | `PI_CODEX_APP_SERVER_HOST_NAME` |
 | Remote control off | env | `PI_CODEX_REMOTE_CONTROL=0` |
 
 ## Dependencies
 
-- `pi-codex-app-server` — the Remote Control daemon (npm).
+- `ws` — the built-in Remote host's WebSocket transport (npm).
 - `qrcode` — terminal QR codes for pairing (npm).
 
 Pi packages (`@earendil-works/pi-ai`, `pi-coding-agent`, `pi-tui`, `typebox`) are declared as peer dependencies and supplied by Pi itself.
+
+Git installs compile the Remote host through `prepare`. For a source checkout, run `npm ci`, `npm run check`, and `npm test`. `npm pack --dry-run` checks that `dist/remote` is included. Tests use temporary directories, fake credentials, and local servers; they do not pair devices or call paid models.
 
 ## Notes and caveats
 
@@ -104,4 +111,4 @@ Pi packages (`@earendil-works/pi-ai`, `pi-coding-agent`, `pi-tui`, `typebox`) ar
 
 ## License
 
-MIT
+MIT. The upstream protocol test fixtures in `tests/fixtures/codex/` retain their Apache-2.0 license and notices.

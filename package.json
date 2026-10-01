@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "description": "Codex-style Pi extension: subscription web search, Codex image generation, usage-aware statusline footer, ChatGPT Remote Control, skill mentions, side conversations, and editor tweaks.",
   "type": "module",
+  "engines": { "node": ">=22.19.0" },
   "license": "MIT",
   "author": "yanun0323",
   "homepage": "https://github.com/yanun0323/codex-ish#readme",
@@ -25,24 +26,34 @@
   ],
   "files": [
     "extensions",
-    "README.md",
+    "dist",
+    "src/remote",
+    "scripts/build-remote.mjs",
+    "tsconfig.remote.json",
+    "README*.md",
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test \"tests/*.test.mjs\"",
-    "check": "tsc -p tsconfig.json"
+    "build": "node scripts/build-remote.mjs",
+    "test": "npm run build && node --test \"tests/*.test.mjs\"",
+    "check": "tsc -p tsconfig.remote.json --emitDeclarationOnly && tsc -p tsconfig.json",
+    "prepare": "npm run build",
+    "prepack": "npm run build"
   },
   "devDependencies": {
-    "typescript": "^5.9.0"
+    "typescript": "^5.9.0",
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.0",
+    "ajv": "^8.17.1"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-coding-agent": ">=0.87.1",
     "@earendil-works/pi-tui": "*",
     "typebox": "*"
   },
   "dependencies": {
-    "pi-codex-app-server": "^0.1.1",
+    "ws": "^8.22.0",
     "qrcode": "^1.5.4"
   }
 }

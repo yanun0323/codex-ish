@@ -18,8 +18,8 @@ pi install git:github.com/yanun0323/codex-ish
 
 설치 후 Pi를 재시작하세요. 요구 사항:
 
-- Pi Coding Agent (플러그인이 Pi의 패키지를 가져오지만, Pi가 직접 제공합니다).
-- Node.js 22.5+ (내장 `node:sqlite` 사용).
+- Pi Coding Agent 0.87.1+ (Remote는 호스트의 Pi SDK를 사용합니다).
+- Node.js 22.19+ (내장 `node:sqlite` 사용). Remote는 현재 macOS와 Linux를 지원합니다.
 - 검색, 이미지 생성, Remote Control은 OpenAI Codex 로그인(`/login` → OpenAI Codex)이 필요합니다. DuckDuckGo 검색과 상태줄은 로그인 없이도 동작합니다.
 
 ## 기능
@@ -49,15 +49,19 @@ pi install git:github.com/yanun0323/codex-ish
 
 ### ChatGPT Remote Control (`/remote`)
 
-ChatGPT 모바일 앱에서 이 Pi 호스트를 제어합니다.
+**실험 기능:** 모바일과 Mac의 Codex 클라이언트가 Pi 대화를 공유하도록 하는 내장 Remote 호스트입니다. 모의 클라이언트와 Pi SDK로 테스트했지만, 실제 앱의 페어링과 호환성은 아직 검증하지 않았습니다.
 
 ```
 /remote status | start | stop | pair | devices | revoke CLIENT_ID
 ```
 
-- `/remote pair`는 ChatGPT로 스캔할 QR 코드와 수동 페어링 코드를 보여줍니다.
-- 로컬 `pi-codex-app-server` 데몬을 실행합니다 (세션 시작 시 자동 시작, `PI_CODEX_APP_SERVER_AUTOSTART=0`으로 비활성화 가능).
-- 이전 별칭: `/codex-server`.
+- `/remote pair`는 확인을 받은 뒤 QR 코드와 수동 코드를 표시합니다. 두 기기를 같은 호스트에 페어링하고 같은 대화를 여세요. OpenAI 중계 서비스와 Pi의 ChatGPT 구독 로그인은 여전히 필요합니다.
+- 대화마다 실행을 담당하는 Pi는 하나입니다. 양쪽에 같은 메시지와 업데이트를 보내며 작업 중 보낸 메시지는 후속 메시지로 대기합니다. 터미널 대화는 원래 Pi가 계속 실행하고 연결이 끊겨도 두 번째 실행 프로세스를 만들지 않습니다. Pi에서 해당 대화를 열어 다시 연결하세요. 원격으로 만든 대화는 백그라운드 Pi가 실행합니다.
+- 홈 디렉터리 탐색, 폴더 생성, 공유 프로젝트 API를 제공합니다. 홈 밖의 프로젝트를 등록할 수 있는 것은 로컬 Pi뿐입니다. 파일 브라우저가 알려진 인증 정보 위치를 숨기지만 **샌드박스는 아닙니다**. 페어링된 기기는 호스트 사용자 권한으로 Pi 도구를 사용할 수 있습니다. 신뢰하는 기기만 페어링하세요.
+- 내장 백그라운드 서비스와 인증된 비공개 Unix socket을 사용하며, `pi-codex-app-server`나 `codex` 실행 파일은 필요 없습니다. Pi 세션이 시작되면 로컬 서비스를 시작합니다 (`PI_CODEX_APP_SERVER_AUTOSTART=0`으로 해제). 처음 중계 서비스에 연결하려면 `/remote start` 또는 `/remote pair`를 실행해야 하며, 활성화한 호스트는 재시작 후 다시 연결됩니다. `/remote stop`은 서비스를 비활성화하고 종료하지만 터미널 Pi 작업은 멈추지 않습니다.
+- 별도의 상태 디렉터리를 사용합니다. 이전 서비스가 실행 중이면 `/remote stop` 후 `/remote pair`를 실행하세요. 기존 데이터와 페어링은 옮기거나 삭제하지 않습니다. 호스트는 원래 ChatGPT 계정에 연결됩니다. 되돌리려면 새 서비스를 멈추고 이전 버전을 다시 설치하세요. 기존 상태는 보존됩니다.
+- Codex App Server API 일부만 구현했습니다. 지원하지 않는 메서드, 설정 덮어쓰기, 샌드박스나 승인 정책은 오류를 반환합니다. 진행 중인 터미널 작업을 백그라운드로 넘기지 않습니다. 터미널 재연결이나 브랜치 변경 후 대화를 다시 읽고, 실행 결과가 불확실한 작업을 무조건 재전송하지 마세요. 마지막 미지원 앱 요청은 `/remote status`에서 확인할 수 있습니다.
+- 이전 별칭: `/codex-server`. 프로토콜 테스트는 Codex commit `444da310e108da16aaeb18fd790b0ac464f08aca`를 기준으로 합니다.
 
 ### 빠른 모드 (`/fast`)
 
@@ -83,17 +87,20 @@ ChatGPT 모바일 앱에서 이 Pi 호스트를 제어합니다.
 | 설정 | 위치 | 비고 |
 |---|---|---|
 | 빠른 모드 | `~/.pi/agent/codex-ish.json` | `/fast`가 저장 |
-| Remote 데몬 홈 디렉터리 | `~/.pi/agent/codex-app-server/` | `PI_CODEX_APP_SERVER_HOME`으로 재정의 |
+| Remote 상태 디렉터리 | `~/.pi/agent/codex-ish-remote/` | `PI_CODEX_ISH_REMOTE_HOME`으로 재정의. 비공개로 유지하세요 |
 | Remote 자동 시작 | 환경 변수 | `PI_CODEX_APP_SERVER_AUTOSTART=0` 비활성화 |
-| Remote 수신 주소 | 환경 변수 | `PI_CODEX_APP_SERVER_LISTEN` (기본값 `ws://127.0.0.1:0`) |
+| Remote 로컬 연결 | Remote 디렉터리의 `host.sock` | 비공개 Unix socket. `PI_CODEX_APP_SERVER_LISTEN`은 더 이상 사용하지 않음 |
+| Remote 호스트 이름 | 환경 변수 | `PI_CODEX_APP_SERVER_HOST_NAME` |
 | Remote control 해제 | 환경 변수 | `PI_CODEX_REMOTE_CONTROL=0` |
 
 ## 의존성
 
-- `pi-codex-app-server` — Remote Control 데몬 (npm).
+- `ws` — 내장 Remote 호스트의 WebSocket 통신 (npm).
 - `qrcode` — 페어링용 터미널 QR 코드 (npm).
 
 Pi 패키지 (`@earendil-works/pi-ai`, `pi-coding-agent`, `pi-tui`, `typebox`)는 peer dependencies로 선언되어 있으며 Pi 자체가 제공합니다.
+
+Git 설치 시 `prepare`가 Remote 호스트를 컴파일합니다. 소스에서 개발하려면 `npm ci`, `npm run check`, `npm test`를 실행하세요. `npm pack --dry-run`으로 `dist/remote`가 포함되는지 확인할 수 있습니다. 테스트는 임시 디렉터리, 모의 인증 정보, 로컬 서버만 사용하며 실제 기기를 페어링하거나 유료 모델을 호출하지 않습니다.
 
 ## 주의 사항
 
@@ -104,4 +111,4 @@ Pi 패키지 (`@earendil-works/pi-ai`, `pi-coding-agent`, `pi-tui`, `typebox`)�
 
 ## 라이선스
 
-MIT
+MIT. `tests/fixtures/codex/`의 업스트림 프로토콜 테스트 데이터는 원래 Apache-2.0 라이선스와 고지를 유지합니다.

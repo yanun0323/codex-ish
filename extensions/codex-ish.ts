@@ -1,10 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
 import { mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { homedir, hostname } from "node:os";
-import { createConnection } from "node:net";
-import { DatabaseSync } from "node:sqlite";
+import { homedir } from "node:os";
+import { registerRemoteControl as installRemoteControl } from "../dist/remote/client.js";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join, resolve } from "node:path";
 import {
@@ -45,7 +43,7 @@ import {
 
 const AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
 
-// Resolve a dependency (e.g. "pi-codex-app-server/dist/cli.js") by walking up
+// Resolve a dependency (e.g. "qrcode/lib/index.js") by walking up
 // from this extension file's own node_modules first (installed as a pi package),
 // then falling back to Pi's global agent npm directory (manual install).
 function extensionDirectory(): string | undefined {
@@ -103,30 +101,6 @@ Only messages after this boundary are active user instructions for this side con
 type Timer = ReturnType<typeof setTimeout> & { unref?: () => void };
 type EditorFactory = NonNullable<ReturnType<ExtensionContext["ui"]["getEditorComponent"]>>;
 type Rgb = readonly [red: number, green: number, blue: number];
-
-type RemoteDaemonStatus =
-  | { state: "stopped" }
-  | {
-      state: "running";
-      endpoint: { pid: number; startedAt?: string; transport: "websocket"; url: string };
-    };
-
-type RemoteDevice = {
-  clientId: string;
-  displayName: string | null;
-  deviceType: string | null;
-  platform: string | null;
-  osVersion: string | null;
-  deviceModel: string | null;
-  appVersion: string | null;
-  lastSeenAt: number | null;
-};
-
-type RemoteEnrollment = {
-  environmentId: string;
-  remoteControlToken: string;
-  serverId: string;
-};
 
 type RemotePairing = {
   environmentId: string;
@@ -1519,367 +1493,6 @@ function registerCodexImages(pi: ExtensionAPI): void {
   });
 }
 
-const remoteDelay = (milliseconds: number) =>
-  new Promise<void>((resolveDelay) => setTimeout(resolveDelay, milliseconds));
-
-type RemoteServerConfig = {
-  autoStart: boolean;
-  hostName: string;
-  listenUrl: URL;
-  paths: { database: string; endpoint: string; home: string; logs: string };
-  piAgentDir: string;
-  remoteControl: { baseUrl: URL; enabled: boolean };
-};
-
-function remoteServerConfig(): RemoteServerConfig {
-  const home = process.env.PI_CODEX_APP_SERVER_HOME
-    ? resolve(process.env.PI_CODEX_APP_SERVER_HOME)
-    : join(AGENT_DIR, "codex-app-server");
-  return {
-    autoStart: process.env.PI_CODEX_APP_SERVER_AUTOSTART !== "0",
-    hostName: process.env.PI_CODEX_APP_SERVER_HOST_NAME ?? hostname(),
-    listenUrl: new URL(process.env.PI_CODEX_APP_SERVER_LISTEN ?? "ws://127.0.0.1:0"),
-    paths: {
-      database: join(home, "state.sqlite"),
-      endpoint: join(home, "endpoint.json"),
-      home,
-      logs: join(home, "logs"),
-    },
-    piAgentDir: AGENT_DIR,
-    remoteControl: {
-      baseUrl: new URL(process.env.PI_CODEX_REMOTE_BASE_URL ?? "https://chatgpt.com/backend-api/"),
-      enabled: process.env.PI_CODEX_REMOTE_CONTROL !== "0",
-    },
-  };
-}
-
-async function createRemotePairing(config: RemoteServerConfig): Promise<RemotePairing> {
-  const modulePath = pathToFileURL(resolveDependency("pi-codex-app-server", "dist", "index.js")).href;
-  const remoteModule = await import(modulePath) as {
-    startRemoteControlPairing: (value: RemoteServerConfig) => Promise<{
-      environmentId: string;
-      pairingCode: string;
-      manualPairingCode: string | null;
-      expiresAt: string;
-    }>;
-  };
-  return await remoteModule.startRemoteControlPairing(config);
-}
-
-function processIsRunning(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error instanceof Error && "code" in error && error.code === "EPERM";
-  }
-}
-
-async function endpointIsListening(value: string): Promise<boolean> {
-  let url: URL;
-  try {
-    url = new URL(value);
-  } catch {
-    return false;
-  }
-  const port = Number(url.port);
-  if (!Number.isInteger(port) || port <= 0) return false;
-  return await new Promise<boolean>((resolveCheck) => {
-    const socket = createConnection({ host: url.hostname, port });
-    let settled = false;
-    const finish = (available: boolean) => {
-      if (settled) return;
-      settled = true;
-      socket.destroy();
-      resolveCheck(available);
-    };
-    socket.once("connect", () => finish(true));
-    socket.once("error", () => finish(false));
-    socket.setTimeout(300, () => finish(false));
-  });
-}
-
-async function readRemoteDaemonStatus(): Promise<RemoteDaemonStatus> {
-  const config = remoteServerConfig();
-  try {
-    const endpoint = object(JSON.parse(await readFile(config.paths.endpoint, "utf8")));
-    if (
-      !endpoint || typeof endpoint.pid !== "number" || !Number.isInteger(endpoint.pid) ||
-      endpoint.pid <= 0 || endpoint.transport !== "websocket" ||
-      typeof endpoint.url !== "string" || !processIsRunning(endpoint.pid) ||
-      !await endpointIsListening(endpoint.url)
-    ) return { state: "stopped" };
-    return {
-      state: "running",
-      endpoint: {
-        pid: endpoint.pid,
-        startedAt: typeof endpoint.startedAt === "string" ? endpoint.startedAt : undefined,
-        transport: "websocket",
-        url: endpoint.url,
-      },
-    };
-  } catch {
-    return { state: "stopped" };
-  }
-}
-
-async function startRemoteDaemon(): Promise<RemoteDaemonStatus> {
-  const current = await readRemoteDaemonStatus();
-  if (current.state === "running") return current;
-
-  const config = remoteServerConfig();
-  await rm(config.paths.endpoint, { force: true });
-  const cli = resolveDependency("pi-codex-app-server", "dist", "cli.js");
-  const child = spawn(process.execPath, [cli, "daemon"], {
-    detached: true,
-    stdio: "ignore",
-    windowsHide: true,
-  });
-  if (!child.pid) throw new Error("Remote Control server did not receive a process ID.");
-  const expectedPid = child.pid;
-  let earlyFailure: Error | undefined;
-  child.once("error", (error) => {
-    earlyFailure = error;
-  });
-  child.once("exit", (code) => {
-    earlyFailure ??= new Error(`Remote Control server stopped before startup (${code ?? "unknown"}).`);
-  });
-  child.unref();
-
-  const deadline = Date.now() + 60_000;
-  while (Date.now() < deadline) {
-    if (earlyFailure) throw earlyFailure;
-    const status = await readRemoteDaemonStatus();
-    if (status.state === "running" && status.endpoint.pid === expectedPid) return status;
-    await remoteDelay(100);
-  }
-  throw new Error("Remote Control server did not start within 60 seconds.");
-}
-
-async function stopRemoteDaemon(): Promise<RemoteDaemonStatus> {
-  const current = await readRemoteDaemonStatus();
-  if (current.state === "stopped") return current;
-  process.kill(current.endpoint.pid, "SIGTERM");
-  const deadline = Date.now() + 5_000;
-  while (processIsRunning(current.endpoint.pid) && Date.now() < deadline) await remoteDelay(50);
-  if (processIsRunning(current.endpoint.pid)) {
-    process.kill(current.endpoint.pid, "SIGKILL");
-    const killDeadline = Date.now() + 1_000;
-    while (processIsRunning(current.endpoint.pid) && Date.now() < killDeadline) await remoteDelay(25);
-    if (processIsRunning(current.endpoint.pid)) {
-      throw new Error("Remote Control server could not be stopped.");
-    }
-  }
-  await rm(remoteServerConfig().paths.endpoint, { force: true });
-  return { state: "stopped" };
-}
-
-function remoteEnrollment(): RemoteEnrollment {
-  const config = remoteServerConfig();
-  const database = new DatabaseSync(config.paths.database, { readOnly: true });
-  try {
-    const row = database.prepare(
-      "select value from remote_state where key = 'remote-control:enrollment'",
-    ).get() as { value?: unknown } | undefined;
-    const enrollment = object(
-      typeof row?.value === "string" ? JSON.parse(row.value) : row?.value,
-    );
-    if (
-      !enrollment || typeof enrollment.environmentId !== "string" ||
-      typeof enrollment.remoteControlToken !== "string" ||
-      typeof enrollment.serverId !== "string"
-    ) {
-      throw new Error("This Pi host is not enrolled yet. Run /remote pair first.");
-    }
-    return {
-      environmentId: enrollment.environmentId,
-      remoteControlToken: enrollment.remoteControlToken,
-      serverId: enrollment.serverId,
-    };
-  } finally {
-    database.close();
-  }
-}
-
-function remoteEnvironmentId(): string {
-  return remoteEnrollment().environmentId;
-}
-
-async function remotePairingClaimed(
-  pairing: RemotePairing,
-  code: { manual_pairing_code: string } | { pairing_code: string },
-): Promise<boolean> {
-  const enrollment = remoteEnrollment();
-  if (
-    enrollment.environmentId !== pairing.environmentId
-  ) throw new Error("Remote Control host enrollment changed during pairing.");
-  const statusUrl = new URL(
-    "wham/remote/control/server/pair/status",
-    remoteServerConfig().remoteControl.baseUrl,
-  );
-  const response = await fetch(statusUrl, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${enrollment.remoteControlToken}`,
-      "content-type": "application/json",
-    },
-    body: JSON.stringify(code),
-    signal: AbortSignal.timeout(10_000),
-  });
-  if (!response.ok) {
-    throw new Error(`Remote Control pairing status failed: HTTP ${response.status}`);
-  }
-  const body = object(await response.json());
-  return body?.claimed === true;
-}
-
-async function waitForRemotePairing(pairing: RemotePairing): Promise<boolean> {
-  const expiresAt = Date.parse(pairing.expiresAt);
-  const deadline = Math.min(
-    Number.isFinite(expiresAt) ? expiresAt : Date.now() + 120_000,
-    Date.now() + 120_000,
-  );
-  while (Date.now() < deadline) {
-    if (await remotePairingClaimed(pairing, { pairing_code: pairing.pairingCode })) return true;
-    if (
-      pairing.manualPairingCode &&
-      await remotePairingClaimed(pairing, { manual_pairing_code: pairing.manualPairingCode })
-    ) return true;
-    await remoteDelay(1_000);
-  }
-  return false;
-}
-
-async function waitForRemoteDevices(
-  environmentId: string,
-  previousClientIds: ReadonlySet<string>,
-): Promise<RemoteDevice[]> {
-  const deadline = Date.now() + 15_000;
-  let devices: RemoteDevice[] = [];
-  do {
-    devices = await listRemoteDevices(environmentId);
-    if (devices.some((device) => !previousClientIds.has(device.clientId))) return devices;
-    await remoteDelay(500);
-  } while (Date.now() < deadline);
-  return devices;
-}
-
-async function callCodexAppServer<T>(method: string, params: unknown): Promise<T> {
-  return await new Promise<T>((resolveCall, rejectCall) => {
-    const child = spawn(process.env.CODEX_BIN ?? "codex", ["app-server", "--stdio"], {
-      stdio: ["pipe", "pipe", "pipe"],
-      windowsHide: true,
-    });
-    let stdout = "";
-    let stderr = "";
-    let settled = false;
-    const finish = (error?: Error, value?: T) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      child.kill("SIGTERM");
-      if (error) rejectCall(error);
-      else resolveCall(value as T);
-    };
-    const timeout = setTimeout(
-      () => finish(new Error("Codex App Server did not respond within 15 seconds.")),
-      15_000,
-    );
-    timeout.unref?.();
-    child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (chunk: string) => {
-      if (stderr.length < 4_000) stderr += chunk;
-    });
-    child.on("error", (error) => finish(error));
-    child.on("exit", (code) => {
-      if (!settled) {
-        finish(new Error(
-          `Codex App Server exited before replying (${code ?? "unknown"}).${stderr.trim() ? ` ${stderr.trim()}` : ""}`,
-        ));
-      }
-    });
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => {
-      stdout += chunk;
-      let newline = stdout.indexOf("\n");
-      while (newline >= 0) {
-        const line = stdout.slice(0, newline);
-        stdout = stdout.slice(newline + 1);
-        newline = stdout.indexOf("\n");
-        if (!line.trim()) continue;
-        let message: Record<string, unknown>;
-        try {
-          message = JSON.parse(line) as Record<string, unknown>;
-        } catch {
-          continue;
-        }
-        if (message.id === 1 && "result" in message) {
-          child.stdin.write(`${JSON.stringify({ method: "initialized" })}\n`);
-          child.stdin.write(`${JSON.stringify({ id: 2, method, params })}\n`);
-        } else if (message.id === 1 && "error" in message) {
-          finish(new Error(`Codex App Server initialization failed: ${JSON.stringify(message.error)}`));
-        } else if (message.id === 2 && "error" in message) {
-          finish(new Error(`Codex App Server request failed: ${JSON.stringify(message.error)}`));
-        } else if (message.id === 2 && "result" in message) {
-          finish(undefined, message.result as T);
-        }
-      }
-    });
-    child.stdin.write(`${JSON.stringify({
-      id: 1,
-      method: "initialize",
-      params: {
-        clientInfo: { name: "codex-ish", title: "Codex Ish", version: "1" },
-        capabilities: { experimentalApi: true, requestAttestation: false },
-      },
-    })}\n`);
-  });
-}
-
-type RemoteDevicePage = { data: RemoteDevice[]; nextCursor: string | null };
-
-async function listRemoteDevices(environmentId: string): Promise<RemoteDevice[]> {
-  const devices: RemoteDevice[] = [];
-  let cursor: string | null = null;
-  do {
-    const response: RemoteDevicePage = await callCodexAppServer<RemoteDevicePage>(
-      "remoteControl/client/list",
-      { environmentId, cursor, limit: 100, order: "desc" },
-    );
-    devices.push(...response.data);
-    cursor = response.nextCursor;
-  } while (cursor && devices.length < 1_000);
-  return devices;
-}
-
-function relativeRemoteTime(timestamp: number | null): string {
-  if (timestamp === null) return "never";
-  const milliseconds = timestamp < 10_000_000_000 ? timestamp * 1_000 : timestamp;
-  const seconds = Math.max(0, Math.round((Date.now() - milliseconds) / 1_000));
-  if (seconds < 60) return `${seconds}s ago`;
-  if (seconds < 3_600) return `${Math.round(seconds / 60)}m ago`;
-  if (seconds < 86_400) return `${Math.round(seconds / 3_600)}h ago`;
-  return `${Math.round(seconds / 86_400)}d ago`;
-}
-
-function formatRemoteDevices(devices: RemoteDevice[]): string {
-  if (devices.length === 0) return "No paired Remote Control devices.";
-  return devices.map((device) => {
-    const details = [
-      device.deviceModel,
-      device.platform,
-      device.osVersion,
-      device.appVersion ? `app ${device.appVersion}` : null,
-    ].filter(Boolean).join(" · ");
-    return [
-      device.displayName ?? device.deviceType ?? "Unnamed device",
-      `  ${device.clientId}`,
-      details ? `  ${details}` : null,
-      `  Last seen: ${relativeRemoteTime(device.lastSeenAt)}`,
-    ].filter(Boolean).join("\n");
-  }).join("\n\n");
-}
-
 class RemotePairingOverlay implements Component {
   constructor(
     private readonly compactLines: string[],
@@ -1914,17 +1527,9 @@ async function renderRemotePairingQrCode(payload: string): Promise<string> {
 }
 
 function registerRemoteControl(pi: ExtensionAPI) {
-  let daemonState: "starting" | "running" | "stopped" | "error" = "starting";
-  const updateState = (status: RemoteDaemonStatus) => {
-    daemonState = status.state;
-    return status;
-  };
-  const showPairing = async (
-    ctx: ExtensionContext,
-    pairing: RemotePairing,
-  ) => {
+  return installRemoteControl(pi, async (ctx: ExtensionContext, pairing: RemotePairing) => {
     const manualCode = pairing.manualPairingCode ?? pairing.pairingCode;
-    if (!ctx.hasUI) {
+    if (ctx.mode !== "tui") {
       ctx.ui.notify(`Remote pairing code: ${manualCode}\nExpires: ${pairing.expiresAt}`, "info");
       return;
     }
@@ -1938,7 +1543,7 @@ function registerRemoteControl(pi: ExtensionAPI) {
           "Press Enter or Esc to close",
         ],
         [
-          "Scan with ChatGPT to pair this Pi host:",
+          "Scan with Codex to pair this Pi host:",
           ...qrCode.trimEnd().split("\n"),
           `Manual code: ${manualCode}`,
           `Expires: ${pairing.expiresAt}`,
@@ -1949,134 +1554,13 @@ function registerRemoteControl(pi: ExtensionAPI) {
       ),
       { overlay: true, overlayOptions: { margin: 1, maxHeight: "90%", width: "90%" } },
     );
-  };
-
-  const command = {
-    description: "Control Pi from ChatGPT Remote",
-    getArgumentCompletions: (prefix: string) => [
-      { value: "status", label: "status", description: "Show host status" },
-      { value: "start", label: "start", description: "Start Remote Control" },
-      { value: "stop", label: "stop", description: "Stop Remote Control" },
-      { value: "pair", label: "pair", description: "Pair another device" },
-      { value: "devices", label: "devices", description: "List paired devices" },
-      { value: "revoke", label: "revoke", description: "Remove a paired device by ID" },
-    ].filter(({ value }) => value.startsWith(prefix.trim())),
-    handler: async (rawArguments: string, ctx: ExtensionContext) => {
-      const [subcommand = "status", clientId, ...extra] = rawArguments.trim().split(/\s+/).filter(Boolean);
-      if (
-        extra.length > 0 ||
-        (subcommand !== "revoke" && clientId !== undefined) ||
-        !["status", "start", "stop", "pair", "devices", "revoke"].includes(subcommand)
-      ) {
-        ctx.ui.notify("Usage: /remote <status|start|stop|pair|devices|revoke CLIENT_ID>", "warning");
-        return;
-      }
-      try {
-        if (subcommand === "start") {
-          const status = updateState(await startRemoteDaemon());
-          ctx.ui.notify(`Remote Control is running.\n${status.state === "running" ? status.endpoint.url : ""}`, "info");
-        } else if (subcommand === "stop") {
-          updateState(await stopRemoteDaemon());
-          ctx.ui.notify("Remote Control stopped. Paired devices remain authorized.", "info");
-        } else if (subcommand === "pair") {
-          updateState(await startRemoteDaemon());
-          let previousDevices: RemoteDevice[] = [];
-          try {
-            previousDevices = await listRemoteDevices(remoteEnvironmentId());
-          } catch {
-            // The first pairing creates the host enrollment.
-          }
-          const previousClientIds = new Set(previousDevices.map((device) => device.clientId));
-          const pairing = await createRemotePairing(remoteServerConfig());
-          const environmentId = pairing.environmentId;
-          await showPairing(ctx, pairing);
-          if (!await waitForRemotePairing(pairing)) {
-            ctx.ui.notify("Pairing was not confirmed within two minutes.", "warning");
-            return;
-          }
-          const devices = await waitForRemoteDevices(environmentId, previousClientIds);
-          const added = devices.filter((device) => !previousClientIds.has(device.clientId));
-          const missing = previousDevices.filter(
-            (device) => !devices.some((current) => current.clientId === device.clientId),
-          );
-          ctx.ui.notify(
-            missing.length > 0
-              ? `Paired ${added.length} new device(s), but ${missing.length} previous device(s) disappeared. The OpenAI pairing service did not preserve every grant.`
-              : `Remote Control paired. ${devices.length} device(s) are authorized.`,
-            missing.length > 0 ? "warning" : "info",
-          );
-        } else if (subcommand === "devices") {
-          ctx.ui.notify(formatRemoteDevices(await listRemoteDevices(remoteEnvironmentId())), "info");
-        } else if (subcommand === "revoke") {
-          if (!clientId) {
-            ctx.ui.notify("Usage: /remote revoke CLIENT_ID", "warning");
-            return;
-          }
-          const environmentId = remoteEnvironmentId();
-          await callCodexAppServer<Record<string, never>>(
-            "remoteControl/client/revoke",
-            { environmentId, clientId },
-          );
-          ctx.ui.notify(`Revoked Remote Control device ${clientId}.`, "info");
-        } else {
-          const status = updateState(await readRemoteDaemonStatus());
-          let environmentId = "not enrolled";
-          try {
-            environmentId = remoteEnvironmentId();
-          } catch {
-            // Pairing creates the enrollment.
-          }
-          ctx.ui.notify(
-            status.state === "running"
-              ? [
-                  "Remote Control: running",
-                  `PID: ${status.endpoint.pid}`,
-                  `WebSocket: ${status.endpoint.url}`,
-                  `Started: ${status.endpoint.startedAt ?? "unknown"}`,
-                  `Environment: ${environmentId}`,
-                ].join("\n")
-              : `Remote Control: stopped\nEnvironment: ${environmentId}`,
-            "info",
-          );
-        }
-      } catch (error) {
-        daemonState = "error";
-        const message = error instanceof Error ? error.message : String(error);
-        ctx.ui.notify(`Remote Control failed: ${message}`, "warning");
-      }
-    },
-  } satisfies Parameters<ExtensionAPI["registerCommand"]>[1];
-
-  pi.registerCommand("remote", command);
-  pi.registerCommand("codex-server", command);
-  pi.on("session_start", async (_event, ctx) => {
-    try {
-      updateState(
-        remoteServerConfig().autoStart
-          ? await startRemoteDaemon()
-          : await readRemoteDaemonStatus(),
-      );
-    } catch (error) {
-      daemonState = "error";
-      const message = error instanceof Error ? error.message : String(error);
-      ctx.ui.notify(`Remote Control did not start: ${message}`, "warning");
-    }
   });
-  return {
-    footerText: () => daemonState === "running"
-      ? "remote on"
-      : daemonState === "starting"
-        ? "remote …"
-        : daemonState === "error"
-          ? "remote error"
-          : "remote off",
-  };
 }
 
 export default function codexIsh(pi: ExtensionAPI) {
-  const remoteControl = registerRemoteControl(pi);
   registerWebSearch(pi);
   registerCodexImages(pi);
+  const remoteControl = registerRemoteControl(pi);
   let fastEnabled = false;
   let codexQuotaState: QuotaState<CodexQuotaData> = { kind: "loading" };
   let antigravityQuotaState: QuotaState<AntigravityQuotaGroup[]> = { kind: "loading" };
