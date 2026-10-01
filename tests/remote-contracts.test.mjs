@@ -14,6 +14,25 @@ function valid(name, value) {
   assert.ok(validate(value), `${name}: ${JSON.stringify(validate.errors)}`);
 }
 
+test("initialize advertises the App Server compatibility version, not the Pi package version", async t => {
+  const { app } = await fixture(t); const c = await client(app, "desktop");
+  const { userAgent } = c.messages[0].result;
+  // The desktop reads the first product/version token before accepting a remote host.
+  const version = /^.+?\/(?<version>\S+)/.exec(userAgent)?.groups?.version;
+  assert.equal(version, "0.141.0", "desktop requires App Server 0.141.0 or newer");
+  const pkg = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
+  assert.ok(userAgent.includes(`pi-codex-ish ${pkg.version}`), "keep the actual package identity visible separately");
+
+  const start = await c.send("thread/start");
+  assert.equal(start.result.thread.cliVersion, version);
+  assert.equal(start.result.thread.originator, "pi-codex-ish");
+  assert.ok((await c.send("model/list")).result);
+  assert.ok((await c.send("config/read")).result);
+  assert.ok((await c.send("thread/list")).result);
+  // A compatible version must not silently acknowledge APIs the Pi host cannot implement.
+  assert.equal((await c.send("unsupported/desktopMethod")).error.code, -32601);
+});
+
 test("implemented responses match the pinned upstream Codex schemas", async t => {
   const { app, config } = await fixture(t); const c = await client(app, "app");
   valid("InitializeResponse", c.messages[0].result);

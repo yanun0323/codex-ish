@@ -7,6 +7,7 @@ import { fixture, input, eventually } from "./remote-helpers.mjs";
 
 test("two clients share a session over a real v3 WebSocket; reconnect replays updates without rerunning input", async t => {
   const f = await fixture(t);
+  f.app.options.control = { identity: async () => ({ accountId: "fake", accessToken: "private-host-token" }) };
   const backend = new WebSocketServer({ host: "127.0.0.1", port: 0 }); await once(backend, "listening");
   const messages = []; const connections = []; let socket; let ack = true;
   backend.on("connection", (current, request) => {
@@ -37,7 +38,10 @@ test("two clients share a session over a real v3 WebSocket; reconnect replays up
   };
   for (const client of ["phone", "mac"]) {
     const result = await call(client, 1, "initialize", { clientInfo: { name: client, version: "1" } }); assert.ok(result.result);
-    send(client, { method: "initialized" });
+    // Desktop proceeds straight to getAuthStatus; older clients may send initialized.
+    if (client === "phone") send(client, { method: "initialized" });
+    const auth = await call(client, "desktop-auth", "getAuthStatus", { includeToken: false, refreshToken: false });
+    assert.deepEqual(auth.result, { authMethod: "chatgpt", authToken: null, requiresOpenaiAuth: true });
   }
   const created = await call("phone", 2, "thread/start", { cwd: f.config.userHome }); const id = created.result.thread.id;
   await call("mac", 2, "thread/resume", { threadId: id });

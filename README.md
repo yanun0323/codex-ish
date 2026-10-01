@@ -49,18 +49,18 @@ Custom footer with model, provider, remote-control state, context usage, and liv
 
 ### ChatGPT Remote Control (`/remote`)
 
-**Experimental:** a built-in host for sharing Pi conversations between mobile and Mac Codex clients. Automated clients and the Pi SDK are tested; real App pairing and compatibility are not yet verified.
+**Experimental:** a built-in host for sharing Pi conversations between mobile and Mac Codex clients. Automated clients and the Pi SDK are tested; pairing and connection with the real macOS desktop App have also been verified. Mobile clients and end-to-end App workflows are not yet verified. `process/spawn` is not supported, so some desktop terminal features may be unavailable.
 
 ```
 /remote status | start | stop | pair | devices | revoke CLIENT_ID
 ```
 
 - `/remote pair` asks for confirmation, then shows a QR code and manual code. Pair both devices with this host and open the same conversation. The OpenAI relay and a ChatGPT-backed Pi login are still required.
-- Each conversation has one Pi execution owner. Both clients receive the same messages and updates; messages sent during work become follow-ups. A connected terminal stays the owner. Losing that connection never starts a second writer; reopen the session in Pi to reconnect it. Remotely created conversations use background Pi workers.
+- Each conversation has one Pi execution owner. Both clients receive the same messages and updates; messages sent during work become follow-ups. A connected terminal stays the owner. Losing that connection never starts a second writer. Saved history stays readable; reopen the session in Pi and run `/remote start` to send messages again. Remotely created conversations use background Pi workers.
 - Provides home-directory browsing, folder creation, and shared projects. Only local Pi registration can share a project outside home. Known credential locations are hidden by the file browser, **not sandboxed**: paired devices can use Pi tools with the host user's permissions. Pair only trusted devices.
 - Uses its own background process and an authenticated private Unix socket. No `pi-codex-app-server` package or `codex` executable is needed. Session startup starts the local host unless `PI_CODEX_APP_SERVER_AUTOSTART=0`; first-time relay access requires `/remote start` or `/remote pair`. An enabled host reconnects after restart. `/remote stop` disables and stops it without stopping terminal Pi work.
 - Uses a separate state directory. If the old daemon is running, use `/remote stop`, then `/remote pair`; old data and grants are not migrated or deleted. The host remains bound to its original ChatGPT account. To roll back, stop the new host and reinstall the prior package; its old state is untouched.
-- Only part of the Codex App Server API is implemented. Unsupported methods, configuration overrides, and sandbox/approval policies return errors. Running terminal work is not transferred to a background worker. After a terminal reconnect or branch change, reread the conversation; never blindly resend uncertain work. Check `/remote status` for the last unsupported App method.
+- Only part of the Codex App Server API is implemented. Codex-only desktop defaults (feature flags, extra instructions, and personality) are declined with a warning; Pi keeps its local settings. Unknown overrides, unsupported methods, and sandbox/approval changes still return errors. Running terminal work is not transferred to a background worker. After a terminal reconnect or branch change, reread the conversation; never blindly resend uncertain work. Check `/remote status` for the last unsupported App method.
 - Legacy alias: `/codex-server`. Protocol tests use Codex commit `444da310e108da16aaeb18fd790b0ac464f08aca`.
 
 ### Fast mode (`/fast`)

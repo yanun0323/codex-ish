@@ -18,11 +18,16 @@ export function text(value: unknown, name: string, max = 4096): string {
   return value;
 }
 export function page<T>(values: T[], params: JsonObject = {}): { data: T[]; nextCursor: string | null } {
-  const offset = params.cursor == null ? 0 : Number(params.cursor);
-  const limit = params.limit ?? 50;
-  if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isInteger(limit) || limit < 1 || limit > 100) {
-    throw new RpcError(-32602, "Invalid pagination. Use a limit between 1 and 100.");
+  if (params.cursor != null && (typeof params.cursor !== "string" || !/^(0|[1-9]\d*)$/.test(params.cursor))) {
+    throw new RpcError(-32602, "Use the nextCursor returned by the previous page.");
   }
+  const offset = params.cursor == null ? 0 : Number(params.cursor);
+  const requested = params.limit ?? 50;
+  if (!Number.isSafeInteger(offset) || !Number.isInteger(requested) || requested < 0 || requested > 0xffffffff) {
+    throw new RpcError(-32602, "Use a non-negative integer page size and a valid cursor.");
+  }
+  // Desktop requests 200 entries. A server-side cap is valid; rejecting it breaks hydration.
+  const limit = Math.max(1, Math.min(requested, 100));
   return { data: values.slice(offset, offset + limit), nextCursor: offset + limit < values.length ? String(offset + limit) : null };
 }
 export const now = () => Math.floor(Date.now() / 1000);

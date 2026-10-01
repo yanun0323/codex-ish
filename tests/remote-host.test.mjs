@@ -73,7 +73,7 @@ test("local shutdown stops the host without running a model, enrolling, or leavi
 });
 
 test("the actual extension bridge sends remote inputs through Pi and forwards terminal updates", async t => {
-  const { config, host, cleanup } = await hostFixture(t);
+  const { config, host, cleanup, mock } = await hostFixture(t);
   const env = { PI_CODEX_ISH_REMOTE_HOME: config.home, PI_CODING_AGENT_DIR: config.agentDir,
     PI_CODEX_APP_SERVER_AUTOSTART: "0", PI_CODEX_REMOTE_CONTROL: "1", PI_CODEX_ISH_WORKER: "0" };
   const previous = Object.fromEntries(Object.keys(env).map(key => [key, process.env[key]]));
@@ -104,4 +104,16 @@ test("the actual extension bridge sends remote inputs through Pi and forwards te
   ]) handlers.get(event.type)(event, ctx);
   await eventually(() => mac.events("turn/completed").length);
   assert.deepEqual(phone.events("item/agentMessage/delta"), mac.events("item/agentMessage/delta"));
+
+  await host.close();
+  const restarted = await startHost(config, async () => mock);
+  cleanup.push(() => restarted.close());
+  await eventually(() => restarted.sessions.loaded().includes(id), 5000);
+  assert.equal(restarted.status().liveSessions, 1);
+  const reconnected = await client(restarted.app, "reconnected-desktop");
+  assert.equal((await reconnected.send("thread/resume", { threadId: id })).result.thread.canAcceptDirectInput, true);
+  assert.ok((await reconnected.send("turn/start", { threadId: id, input: input("after host restart") })).result);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1][0][0].text, "after host restart");
+  assert.equal(mock.backends.length, 0, "reconnecting must reuse the terminal, not open a worker");
 });

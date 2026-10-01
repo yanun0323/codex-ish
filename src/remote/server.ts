@@ -5,11 +5,13 @@ import type { ControlApi } from "./control-api.js";
 import { HostFiles } from "./filesystem.js";
 import { Sessions, validateExecutionOptions } from "./sessions.js";
 import { State } from "./state.js";
+import { APP_SERVER_USER_AGENT } from "./version.js";
+import { declinedEnablement, DESKTOP_FEATURES, desktopOptions, disabledFeatures } from "./compatibility.js";
 import { object, page, responseError, RpcError, text, now, type JsonObject, type RpcMessage } from "./types.js";
 
 export interface Client {
   id: string; deviceId: string; initialized: boolean; ready: boolean; experimental: boolean;
-  subscriptions: Set<string>; optOut: Set<string>; send: (message: RpcMessage) => void;
+  subscriptions: Set<string>; optOut: Set<string>; warnings: Set<string>; send: (message: RpcMessage) => void;
   requests: Map<string, { signature: string; promise: Promise<RpcMessage>; size: number }>;
 }
 interface ServerOptions {
@@ -32,7 +34,7 @@ export class AppServer {
     let client = this.clients.get(id);
     if (client) { client.send = send; return client; }
     if (this.clients.size >= 128) throw new Error("Too many clients.");
-    client = { id, deviceId, send, initialized: false, ready: false, experimental: false, subscriptions: new Set(), optOut: new Set(), requests: new Map() };
+    client = { id, deviceId, send, initialized: false, ready: false, experimental: false, subscriptions: new Set(), optOut: new Set(), warnings: new Set(), requests: new Map() };
     this.clients.set(id, client); return client;
   }
   disconnect(id: string): void { this.clients.delete(id); }
@@ -47,10 +49,9 @@ export class AppServer {
       if (message.id != null) client.send(responseError(message.id, new RpcError(-32600, "Invalid request.")));
       return;
     }
-    if (message.id === undefined) {
-      if (message.method === "initialized" && client.initialized) client.ready = true;
-      return;
-    }
+    // Older clients may send initialized; desktop proceeds after the initialize response.
+    // Client notifications do not grant readiness or access to requests.
+    if (message.id === undefined) return;
     if (typeof message.id !== "string" && typeof message.id !== "number" || typeof message.id === "number" && !Number.isSafeInteger(message.id)) return;
     const key = `${typeof message.id}:${String(message.id)}`;
     const signature = createHash("sha256").update(JSON.stringify([message.method, message.params])).digest("hex");
@@ -66,7 +67,10 @@ export class AppServer {
       client.requests.set(key, request);
       void promise.then(value => { request!.size = Buffer.byteLength(JSON.stringify(value)); });
     }
-    client.send(await request.promise);
+    const response = await request.promise;
+    client.send(response);
+    // Enable notifications only after the successful initialize response has been sent.
+    if (message.method === "initialize" && !response.error) client.ready = true;
     // Bound replay caches by bytes as well as request count. Turn idempotency lives in durable storage.
     let size = [...client.requests.values()].reduce((total, item) => total + item.size, 0);
     for (const [oldKey, old] of client.requests) {
@@ -85,21 +89,56 @@ export class AppServer {
       const optOut = capabilities.optOutNotificationMethods ?? [];
       if (!Array.isArray(optOut) || optOut.length > 256 || optOut.some(value => typeof value !== "string")) throw new RpcError(-32602, "Invalid notification preferences.");
       client.optOut = new Set(optOut); client.experimental = capabilities.experimentalApi === true; client.initialized = true;
-      return { userAgent: "pi-codex-ish/0.1.0", codexHome: config.home,
+      return { userAgent: APP_SERVER_USER_AGENT, codexHome: config.home,
         platformFamily: process.platform === "win32" ? "windows" : "unix", platformOs: process.platform === "darwin" ? "macos" : process.platform };
     }
-    if (!client.initialized || !client.ready) throw new RpcError(-32600, "Send initialize and initialized before making requests.");
+    if (!client.initialized) throw new RpcError(-32600, "Send initialize before making requests.");
+    if (["thread/start", "thread/resume", "turn/start", "turn/steer"].includes(method)) {
+      const normalized = desktopOptions(params);
+      params = normalized.params;
+      validateExecutionOptions(params);
+      if (normalized.notice) this.desktopNotice(client);
+    }
     switch (method) {
+      case "getAuthStatus": {
+        for (const key of ["includeToken", "refreshToken"]) {
+          if (params[key] != null && typeof params[key] !== "boolean") throw new RpcError(-32602, `${key} must be a boolean.`);
+        }
+        // Desktop uses this legacy RPC to confirm the connection. Pi owns credential
+        // refresh; remote clients may inspect login state but never export its tokens.
+        const auth = control ? await control.identity() : undefined;
+        return { authMethod: auth ? "chatgpt" : null, authToken: null, requiresOpenaiAuth: true };
+      }
       case "model/list": return page(await this.options.models(), params);
       case "account/read": return { account: control?.enrollment ? { type: "chatgpt", email: null, planType: "unknown" } : null,
         requiresOpenaiAuth: true, workspaceRouting: null };
       case "config/read": {
         const models = await this.options.models();
-        return { config: { model: models[0]?.id ?? null, model_provider: "pi", approval_policy: "never",
-          sandbox_mode: "danger-full-access", cwd: config.userHome, user_home: config.userHome,
-          model_reasoning_effort: "medium", service_tier: null }, origins: {}, ...(params.includeLayers ? { layers: [] } : {}) };
+        const current = sessions.list({ ...(params.cwd ? { cwd: params.cwd } : {}), sortKey: "updated_at" })[0];
+        return { config: { model: current?.model ?? models[0]?.id ?? null, model_provider: "pi", approval_policy: "never",
+          sandbox_mode: "danger-full-access", cwd: params.cwd ?? config.userHome, user_home: config.userHome,
+          model_reasoning_effort: current?.reasoningEffort ?? "medium", service_tier: null, features: disabledFeatures() },
+          origins: {}, ...(params.includeLayers ? { layers: [] } : {}) };
       }
-      case "configRequirements/read": return { requirements: null };
+      case "configRequirements/read": return { requirements: {
+        allowedApprovalPolicies: ["never"], allowedSandboxModes: ["danger-full-access"], featureRequirements: disabledFeatures(),
+      } };
+      case "experimentalFeature/list": return page(DESKTOP_FEATURES.map(name => ({ name, enabled: false, defaultEnabled: false,
+        stage: "removed", displayName: null, description: null, announcement: null })), params);
+      case "experimentalFeature/enablement/set": {
+        const enablement = declinedEnablement(params.enablement);
+        if (Object.values(params.enablement).some(Boolean)) this.desktopNotice(client);
+        return { enablement };
+      }
+      case "permissionProfile/list": return { data: [], nextCursor: null };
+      case "collaborationMode/list": return { data: [{ name: "Default", mode: "default", model: null, reasoning_effort: null }] };
+      case "hooks/list": {
+        const cwds = params.cwds ?? [];
+        if (!Array.isArray(cwds) || cwds.length > 100) throw new RpcError(-32602, "Choose up to 100 directories.");
+        const roots = cwds.length ? [...new Set(cwds)] : [config.userHome];
+        await Promise.all(roots.map(cwd => files.directory(cwd)));
+        return { data: roots.map(cwd => ({ cwd, hooks: [], errors: [], warnings: ["Pi extensions are managed in Pi, not as Codex hooks."] })) };
+      }
       case "fs/readDirectory": return files.list(params.path);
       case "fs/getMetadata": return files.metadata(params.path);
       case "fs/createDirectory": {
@@ -169,12 +208,19 @@ export class AppServer {
       }
       case "thread/resume": {
         validateExecutionOptions(params);
-        if (params.path || params.history) throw new RpcError(-32602, "Resume a registered conversation by threadId.");
+        if (params.history != null) throw new RpcError(-32602, "Resume a registered conversation by threadId.");
         const id = text(params.threadId, "threadId");
         const thread = sessions.read(id, false);
+        // Desktop echoes the path we supplied. Never open an arbitrary path from a remote request.
+        if (params.path != null && params.path !== thread.path) throw new RpcError(-32602, "Use the registered conversation path.");
         if (params.cwd && params.cwd !== thread.cwd || params.model && params.model !== thread.model) throw new RpcError(-32602, "Resume the existing conversation without changing its directory or model.");
         client.subscriptions.add(id);
-        try { return await sessions.resume(id); }
+        try {
+          const response = await sessions.resume(id);
+          if (!response.thread.canAcceptDirectInput) this.warning(client, "terminal-offline", "Reconnect this conversation in Pi to send messages.",
+            "The saved history is available. Open this conversation in Pi and run /remote start; no second Pi process was started.");
+          return response;
+        }
         catch (error) { client.subscriptions.delete(id); throw error; }
       }
       case "thread/read": return { thread: sessions.read(text(params.threadId, "threadId"), params.includeTurns === true) };
@@ -226,6 +272,16 @@ export class AppServer {
     }
     state.set("diagnostics", "unsupported", { method, at: now() });
     throw new RpcError(-32601, `This Pi host does not support ${method}.`);
+  }
+  private warning(client: Client, key: string, summary: string, details: string): void {
+    if (client.warnings.has(key)) return;
+    client.warnings.add(key);
+    this.options.state.set("diagnostics", "compatibility", { at: now(), summary });
+    if (!client.optOut.has("configWarning")) client.send({ method: "configWarning", params: { summary, details, path: null, range: null } });
+  }
+  private desktopNotice(client: Client): void {
+    this.warning(client, "desktop-defaults", "Pi keeps its local instructions, tools, and permissions.",
+      "Codex-only feature flags, desktop instructions, and personality settings were not applied. Configure them in Pi. This host does not provide Codex sandboxing or approval checks.");
   }
   private project(id: unknown): JsonObject {
     const project = this.options.state.get("projects", text(id, "projectId"));

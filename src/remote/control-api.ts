@@ -1,5 +1,6 @@
 import type { RemoteConfig } from "./config.js";
 import { State } from "./state.js";
+import { APP_SERVER_VERSION } from "./version.js";
 import { RpcError, type JsonObject } from "./types.js";
 
 export interface Credentials { accessToken: string; accountId: string }
@@ -93,7 +94,7 @@ export class ControlApi {
     }
     if (!response) response = await this.request("server/enroll", "POST", credentials.accessToken,
       { name: this.config.hostName, os: process.platform === "win32" ? "windows" : process.platform,
-        arch: process.arch, app_server_version: "pi-codex-ish/0.1.0", installation_id: installation }, headers);
+        arch: process.arch, app_server_version: APP_SERVER_VERSION, installation_id: installation }, headers);
     const expiry = Date.parse(response.expires_at);
     if (typeof response.server_id !== "string" || typeof response.environment_id !== "string" ||
         typeof response.remote_control_token !== "string" || !Number.isFinite(expiry) || expiry <= Date.now()) {

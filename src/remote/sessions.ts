@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { State } from "./state.js";
+import { APP_SERVER_VERSION } from "./version.js";
 import { now, RpcError, text, type JsonObject } from "./types.js";
 
 export interface BackendInfo {
@@ -36,7 +37,7 @@ export function makeThread(info: BackendInfo): JsonObject {
   return { id: info.id, sessionId: info.id, forkedFromId: null, parentThreadId: null, preview: "", ephemeral: false,
     section: null, sectionEnteredAt: null, projectId: null, historyMode: "legacy", modelProvider: info.provider,
     model: info.model, reasoningEffort: info.effort, createdAt: now(), updatedAt: now(), recencyAt: null,
-    status: { type: "idle" }, path: info.sessionFile ?? null, cwd: info.cwd, cliVersion: "pi-codex-ish/0.1.0",
+    status: { type: "idle" }, path: info.sessionFile ?? null, cwd: info.cwd, cliVersion: APP_SERVER_VERSION,
     originator: "pi-codex-ish", source: { custom: "pi" }, canAcceptDirectInput: true, threadSource: "pi",
     agentNickname: null, agentRole: null, gitInfo: null, name: info.name ?? null, daybreakEnabled: null,
     environments: null, extra: null, turns: [] };
@@ -110,12 +111,28 @@ export class Sessions {
     return thread;
   }
   list(params: JsonObject = {}): JsonObject[] {
+    for (const key of ["modelProviders", "sourceKinds"]) {
+      if (params[key] != null && (!Array.isArray(params[key]) || params[key].some((value: unknown) => typeof value !== "string"))) {
+        throw new RpcError(-32602, `${key} must be a list of strings.`);
+      }
+    }
+    const cwds = params.cwd == null ? [] : Array.isArray(params.cwd) ? params.cwd : [params.cwd];
+    if (cwds.some((cwd: unknown) => typeof cwd !== "string")) throw new RpcError(-32602, "Use a directory path or list of paths.");
+    const sort = params.sortKey ?? "created_at";
+    if (!["created_at", "updated_at", "recency_at", "section_position"].includes(sort) ||
+        params.sortDirection != null && !["asc", "desc"].includes(params.sortDirection)) throw new RpcError(-32602, "Invalid conversation sort order.");
+    const value = (thread: JsonObject): number => sort === "created_at" ? thread.createdAt :
+      sort === "recency_at" ? thread.recencyAt ?? thread.updatedAt : thread.updatedAt;
     return [...this.records.values()].filter(record => record.archived === (params.archived ?? false))
-      .filter(record => !params.cwd || record.thread.cwd === params.cwd)
+      .filter(record => !cwds.length || cwds.includes(record.thread.cwd))
       .filter(record => !params.projectId || record.thread.projectId === params.projectId)
+      .filter(record => !params.parentThreadId || record.thread.parentThreadId === params.parentThreadId)
+      .filter(record => !params.modelProviders?.length || params.modelProviders.includes(record.thread.modelProvider))
+      .filter(record => !params.sourceKinds?.length || params.sourceKinds.includes(record.owner === "live" ? "cli" : "appServer"))
+      .filter(record => !Object.hasOwn(params, "sectionId") || (record.thread.section?.id ?? null) === params.sectionId)
       .filter(record => !params.searchTerm || `${record.thread.name ?? ""} ${record.thread.preview}`.toLowerCase().includes(String(params.searchTerm).toLowerCase()))
       .map(record => this.read(record.thread.id, false))
-      .sort((a, b) => (b.updatedAt - a.updatedAt) * (params.sortDirection === "asc" ? -1 : 1));
+      .sort((a, b) => ((value(b) - value(a)) || b.id.localeCompare(a.id)) * (params.sortDirection === "asc" ? -1 : 1));
   }
   loaded(): string[] { return [...this.backends.keys()]; }
   private serial<T>(id: string, run: () => Promise<T>): Promise<T> {
@@ -141,7 +158,9 @@ export class Sessions {
     return sessionResponse(this.read(id, false));
   }
   async resume(id: string): Promise<JsonObject> {
-    await this.backend(id);
+    // Opening a detached terminal is a read operation, not permission to take over its execution.
+    // Keep the subscription alive so the desktop sees it become writable when Pi reconnects.
+    if (this.record(id).owner !== "live" || this.backends.has(id)) await this.backend(id);
     return sessionResponse(this.read(id));
   }
   private async backend(id: string): Promise<Backend> {
@@ -180,6 +199,7 @@ export class Sessions {
     if (backend.info.busy) this.ensureActive(id);
     this.persist(id);
     this.emit(undefined, "thread/started", { thread: this.read(id, false) });
+    this.emit(id, "thread/status/changed", { threadId: id, status: record.thread.status });
   }
   detach(id: string, backend: Backend): void {
     if (this.backends.get(id) !== backend) return;

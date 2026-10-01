@@ -50,6 +50,8 @@ export async function startHost(config: RemoteConfig, createRuntime: (files: Hos
     status: relay.status, serverName: config.hostName, installationId: state.installationId(),
     environmentId: api.enrollment?.environmentId ?? null, userHome: config.userHome,
     sharedRoots: [...files.roots], enabled: state.get<boolean>("host", "enabled") ?? false,
+    liveSessions: sessions.loaded().filter(id => sessions.record(id).owner === "live").length,
+    lastCompatibilityNotice: state.get("diagnostics", "compatibility") ?? null,
     lastUnsupportedMethod: state.get("diagnostics", "unsupported") ?? null });
   const app = new AppServer({ config, files, state, sessions, models: () => runtime.models(), control: api,
     remoteStatus: status, revoke: id => relay.revoke(id) });

@@ -88,6 +88,7 @@ export function registerRemoteControl(pi: any, showPairing: (ctx: any, pairing: 
   let generation = 0;
   let reconnect: AbortController | undefined;
   let registered = false;
+  let lastBridgeError: string | undefined;
   let capturing = false;
   let pendingEvents: JsonObject[] = [];
   let pendingBytes = 0;
@@ -140,12 +141,12 @@ export function registerRemoteControl(pi: any, showPairing: (ctx: any, pairing: 
             provider: context.model?.provider ?? "pi", effort: context.thinkingLevel === "off" ? "none" : context.thinkingLevel ?? "medium",
             sessionFile: context.sessionManager.getSessionFile(), name: context.sessionManager.getSessionName(), busy: !context.isIdle() }, messages: snapshot });
           if (controller.signal.aborted || epoch !== generation) { connection.close(); return; }
-          registered = true; capturing = false;
+          registered = true; lastBridgeError = undefined; capturing = false;
           for (const event of pendingEvents) connection.notify("bridge/event", { threadId, event });
           pendingEvents = []; pendingBytes = 0;
           update(await connection.call("status"));
           await connection.closed.promise;
-        } catch { if (epoch === generation) state = "disabled"; }
+        } catch (error) { if (epoch === generation) { state = "disabled"; lastBridgeError = errorMessage(error); } }
         finally {
           connection?.close(); if (peer === connection) peer = undefined;
           if (epoch === generation) { registered = false; capturing = false; pendingEvents = []; pendingBytes = 0; }
@@ -240,7 +241,9 @@ export function registerRemoteControl(pi: any, showPairing: (ctx: any, pairing: 
         try { status = await localCall(cfg, "status"); } catch { state = "disabled"; context.ui.notify("Remote is stopped. Run /remote start or /remote pair.", "info"); return; }
         update(status);
         context.ui.notify([`Remote: ${status.status}`, `Host: ${status.serverName}`, `Home: ${status.userHome}`,
-          `Environment: ${status.environmentId ?? "not paired"}`, `This Pi session: ${registered ? "shared" : "not attached"}`,
+          `Environment: ${status.environmentId ?? "not paired"}`, `This Pi session: ${registered ? "shared" : "not attached; run /remote start here"}`,
+          ...(!registered && lastBridgeError ? [`Pi connection: ${lastBridgeError}`] : []),
+          ...(status.lastCompatibilityNotice ? [`App compatibility: ${status.lastCompatibilityNotice.summary}`] : []),
           ...(status.lastUnsupportedMethod ? [`Unsupported App request: ${status.lastUnsupportedMethod.method}`] : [])].join("\n"), "info");
       } catch (error) { context.ui.notify(errorMessage(error), "warning"); }
     },

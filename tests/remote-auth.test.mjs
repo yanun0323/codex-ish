@@ -29,6 +29,7 @@ test("concurrent enrollment uses one request, separates OAuth from host tokens, 
   assert.equal(first.headers.Authorization, "Bearer chatgpt-oauth");
   assert.equal(first.headers["chatgpt-account-id"], "account-1");
   assert.equal(first.body.installation_id, first.headers["x-codex-installation-id"]);
+  assert.equal(first.body.app_server_version, "0.141.0", "enrollment needs the plain App Server compatibility version");
   const connection = await api.connection();
   assert.equal(connection.headers.Authorization, "Bearer host-secret");
   assert.equal(connection.headers["x-codex-protocol-version"], "3");
@@ -77,6 +78,20 @@ test("refresh never silently changes the host identity, except after an explicit
   const missing = setup(t, request => request.path.endsWith("/refresh") ? new Response(null, { status: 404 }) : json(enrollment("token")));
   await missing.api.ensureEnrollment(); missing.api.invalidateToken(); await missing.api.ensureEnrollment();
   assert.deepEqual(missing.requests.map(request => request.path.split("/").at(-1)), ["enroll", "refresh", "enroll"]);
+});
+
+test("upgrading the advertised compatibility version refreshes the existing host without replacing its pairing identity", async t => {
+  const { api, state, requests } = setup(t, () => json(enrollment("refreshed-host-token")));
+  // Enrollment persisted by the old 0.1.0 host has no version field.
+  const existing = { accountId: "account-1", serverId: "server", environmentId: "environment", serverName: "測試主機" };
+  state.set("host", "accountId", existing.accountId);
+  state.set("host", "enrollment", existing);
+  state.set("host", "installationId", "existing-installation");
+  await api.connection();
+  assert.equal(requests.length, 1);
+  assert.ok(requests[0].path.endsWith("/server/refresh"));
+  assert.deepEqual(requests[0].body, { server_id: "server", installation_id: "existing-installation" });
+  assert.deepEqual(api.enrollment, existing);
 });
 
 test("Retry-After postpones further requests and service errors never expose response bodies", async t => {
