@@ -64,9 +64,9 @@ test("desktop defaults can open and use a Pi conversation without enabling Codex
   assert.equal(c.events("turn/completed").length, 1);
 });
 
-test("a detached terminal remains readable and subscribed but cannot start a second writer", async t => {
+test("an unsaved detached terminal remains readable but cannot create a replacement conversation", async t => {
   const { app, sessions, config, mock } = await fixture(t); const c = await client(app, "desktop");
-  const owner = terminal(randomUUID(), config.userHome); sessions.attach(owner);
+  const owner = terminal(randomUUID(), config.userHome); owner.info.sessionFile = undefined; sessions.attach(owner);
   sessions.detach(owner.info.id, owner);
   const response = await c.send("thread/resume", { ...desktopResume, threadId: owner.info.id, path: owner.info.sessionFile });
   assert.ok(response.result, JSON.stringify(response));

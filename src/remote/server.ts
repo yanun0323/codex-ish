@@ -256,10 +256,11 @@ export class AppServer {
         if (params.cwd && params.cwd !== thread.cwd || params.model && params.model !== thread.model) throw new RpcError(-32602, "Resume the existing conversation without changing its directory or model.");
         client.subscriptions.add(id);
         try {
+          if (params.effort != null && params.effort !== thread.reasoningEffort) await sessions.updateSettings(id, { effort: params.effort });
           const response = await sessions.resume(id);
           client.activeThread = id;
-          if (!response.thread.canAcceptDirectInput) this.warning(client, "terminal-offline", "Reconnect this conversation in Pi to send messages.",
-            "The saved history is available. Open this conversation in Pi and run /remote start; no second Pi process was started.");
+          if (!response.thread.canAcceptDirectInput) this.warning(client, "terminal-offline", "This conversation has no saved Pi session to continue in the background.",
+            "Its visible history is available. Reopen the original Pi session to continue.");
           return response;
         }
         catch (error) { client.subscriptions.delete(id); throw error; }

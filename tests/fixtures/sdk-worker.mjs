@@ -94,6 +94,7 @@ try {
   // Reproduce the real desktop's defaults and echoed path against the installed Pi SDK.
   await sessions.close(); sessions = new Sessions(state, runtime.createBackend); desktop = await connectDesktop();
   const resumed = await desktop.send("thread/resume", { ...desktopResume, threadId: id, path: created.thread.path });
+  assert.ok(resumed.result, JSON.stringify(resumed));
   assert.equal(resumed.result.thread.id, id);
   assert.equal(resumed.result.model, "remote-test/reasoning");
   assert.equal(resumed.result.reasoningEffort, "xhigh");

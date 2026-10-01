@@ -1,4 +1,5 @@
 import { spawn, execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -9,6 +10,7 @@ import { connectLocal, localCall, type Peer } from "./ipc.js";
 import { delay, errorMessage, RpcError, type JsonObject } from "./types.js";
 import { hostModulePath, hostThinkingLevels, modelCatalog, reasoningEffort, resolveModel, thinkingLevel, validateModelOptions, type ModelOptions, type ThinkingLevels } from "./models.js";
 import { commandSkills } from "./skills.js";
+import { SessionOwners, sessionTip, type SessionOwner } from "./ownership.js";
 
 const exec = promisify(execFile);
 function hostSdk(): string {
@@ -94,6 +96,31 @@ export function registerRemoteControl(pi: any, showPairing: (ctx: any, pairing: 
   let pendingEvents: JsonObject[] = [];
   let pendingBytes = 0;
   let levels: ThinkingLevels | undefined;
+  const owners = new SessionOwners(cfg.database);
+  let localOwner: SessionOwner | undefined;
+  const ownSession = async () => {
+    const id = ctx.sessionManager.getSessionId();
+    if (localOwner && localOwner.id === id) { owners.assert(localOwner); return; }
+    const file = ctx.sessionManager.getSessionFile();
+    const token = randomUUID();
+    try { await localCall(cfg, "bridge/claim", { threadId: id, sessionFile: file, token, pid: process.pid }); }
+    catch (error) {
+      // A stopped daemon is not required for ordinary terminal use. A live worker's
+      // durable process claim still prevents takeover while its socket is down.
+      if (!["ENOENT", "ECONNREFUSED", "ENOTSOCK"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+    }
+    const owner = owners.claim(id, file, "live", token);
+    try {
+      if (file && existsSync(file) && sessionTip(file) !== ctx.sessionManager.getEntries().at(-1)?.id) {
+        throw new RpcError(-32600, "This conversation changed while Pi was opening. Reopen the saved session to load the latest messages.");
+      }
+      localOwner = owner;
+    } catch (error) { owners.release(owner); throw error; }
+  };
+  const assertOwner = () => {
+    if (!localOwner || localOwner.id !== ctx.sessionManager.getSessionId()) throw new RpcError(-32600, "This conversation is not ready. Reopen it in Pi before sending a message.");
+    owners.assert(localOwner);
+  };
   const modelInfo = () => ({ model: `${ctx.model?.provider ?? "pi"}/${ctx.model?.id ?? "unconfigured"}`,
     provider: ctx.model?.provider ?? "pi", effort: reasoningEffort(pi.getThinkingLevel?.() ?? ctx.thinkingLevel ?? "off") });
   const catalog = async () => {
@@ -103,6 +130,7 @@ export function registerRemoteControl(pi: any, showPairing: (ctx: any, pairing: 
     return modelCatalog(models, levels!, modelInfo().model);
   };
   const configure = async (options: ModelOptions) => {
+    assertOwner();
     const current = modelInfo();
     const changing = options.model != null && options.model !== current.model || options.effort != null && options.effort !== current.effort;
     if (changing && !ctx.isIdle()) throw new RpcError(-32602, "Wait for Pi to finish before changing its model or thinking level.");
@@ -123,11 +151,18 @@ export function registerRemoteControl(pi: any, showPairing: (ctx: any, pairing: 
     stopBridge(); ctx = context;
     const epoch = generation;
     const controller = reconnect = new AbortController();
-    if (process.env.PI_CODEX_REMOTE_CONTROL === "0") { state = "disabled"; return; }
-    if (autoStart) {
+    const disabled = process.env.PI_CODEX_REMOTE_CONTROL === "0";
+    if (autoStart && !disabled) {
       try { await ensureDaemon(cfg); }
       catch (error) { if (epoch === generation) { state = "errored"; context.ui.notify(errorMessage(error), "warning"); } return; }
     }
+    try { await ownSession(); }
+    catch (error) {
+      state = "errored"; context.ui.notify(errorMessage(error), "error");
+      // Do not leave a stale, writable terminal beside a background session.
+      context.shutdown?.(); return;
+    }
+    if (disabled) { state = "disabled"; return; }
     void (async () => {
       while (!controller.signal.aborted && epoch === generation) {
         let connection: Peer | undefined;
@@ -160,7 +195,8 @@ export function registerRemoteControl(pi: any, showPairing: (ctx: any, pairing: 
           if (Buffer.byteLength(JSON.stringify(snapshot)) > 20 * 1024 * 1024) throw new Error("This conversation is too large to attach to Remote. Start a new Pi conversation.");
           await connection.call("bridge/register", { info: { id: threadId, cwd: context.cwd,
             ...modelInfo(), models: await catalog(),
-            sessionFile: context.sessionManager.getSessionFile(), name: context.sessionManager.getSessionName(), busy: !context.isIdle() }, messages: snapshot });
+            sessionFile: context.sessionManager.getSessionFile(), name: context.sessionManager.getSessionName(), busy: !context.isIdle() },
+            owner: { pid: localOwner!.pid, token: localOwner!.token }, messages: snapshot });
           if (controller.signal.aborted || epoch !== generation) { connection.close(); return; }
           registered = true; lastBridgeError = undefined; capturing = false;
           for (const event of pendingEvents) connection.notify("bridge/event", { threadId, event });
@@ -179,7 +215,22 @@ export function registerRemoteControl(pi: any, showPairing: (ctx: any, pairing: 
   pi.on("session_start", async (_event: unknown, context: any) => {
     await startBridge(context, process.env.PI_CODEX_APP_SERVER_AUTOSTART !== "0");
   });
-  pi.on("session_shutdown", () => stopBridge());
+  pi.on("session_shutdown", (_event: unknown, context: any) => {
+    stopBridge();
+    // Quit can precede SDK cancellation. Keep a busy process's claim until it exits;
+    // a dropped socket must never be mistaken for completed work.
+    if (localOwner && context.isIdle()) owners.release(localOwner, context.sessionManager.getLeafId());
+    localOwner = undefined;
+  });
+  pi.on("input", () => {
+    try { assertOwner(); }
+    catch (error) { ctx?.ui.notify(errorMessage(error), "error"); return { action: "handled" }; }
+    return { action: "continue" };
+  });
+  pi.on("tool_call", () => {
+    try { assertOwner(); }
+    catch (error) { return { block: true, reason: errorMessage(error) }; }
+  });
   for (const name of ["model_select", "thinking_level_select"]) {
     pi.on(name, async (_event: JsonObject, context: any) => {
       if (!peer || (!registered && !capturing) || context.sessionManager.getSessionId() !== currentId()) return;

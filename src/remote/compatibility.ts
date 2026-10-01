@@ -41,7 +41,17 @@ export function desktopOptions(raw: JsonObject): { params: JsonObject; notice: b
   const params = { ...raw };
   let notice = false;
   if (params.config != null) {
-    desktopConfig(params.config); notice ||= Object.keys(params.config).length > 0; delete params.config;
+    const settings = { ...object(params.config) };
+    // iOS echoes the thinking selection here when resuming an existing conversation.
+    if (Object.hasOwn(settings, "model_reasoning_effort")) {
+      const effort = settings.model_reasoning_effort;
+      if (effort != null) {
+        if (typeof effort !== "string" || params.effort != null && params.effort !== effort) throw new RpcError(-32602, "Use the same thinking level in the conversation and its settings.");
+        params.effort = effort;
+      }
+      delete settings.model_reasoning_effort;
+    }
+    desktopConfig(settings); notice ||= Object.keys(settings).length > 0; delete params.config;
   }
   if (params.developerInstructions != null) {
     if (typeof params.developerInstructions !== "string" || Buffer.byteLength(params.developerInstructions) > 64 * 1024) {

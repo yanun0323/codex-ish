@@ -82,11 +82,11 @@ test("the actual extension bridge sends remote inputs through Pi and forwards te
   const handlers = new Map(); const calls = []; const id = randomUUID();
   const ctx = { cwd: config.userHome, model: { provider: "fake", id: "test" }, thinkingLevel: "medium", isIdle: () => true,
     ui: { notify() {}, requestRender() {} },
-    sessionManager: { getSessionId: () => id, getBranch: () => [], getSessionFile: () => undefined, getSessionName: () => undefined } };
+    sessionManager: { getSessionId: () => id, getBranch: () => [], getSessionFile: () => undefined, getSessionName: () => undefined, getLeafId: () => null } };
   const pi = { on: (name, handler) => handlers.set(name, handler), registerCommand() {},
     sendUserMessage: (...args) => { calls.push(args); }, setThinkingLevel() {} };
   registerRemoteControl(pi, async () => { throw new Error("No real pairing during tests"); });
-  cleanup.push(async () => handlers.get("session_shutdown")());
+  cleanup.push(async () => handlers.get("session_shutdown")({ type: "session_shutdown", reason: "quit" }, ctx));
   await handlers.get("session_start")({}, ctx);
   await eventually(() => host.sessions.loaded().includes(id));
   const phone = await client(host.app, "phone"); const mac = await client(host.app, "mac");

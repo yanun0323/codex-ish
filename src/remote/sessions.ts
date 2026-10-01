@@ -13,6 +13,7 @@ export interface Backend {
   info: BackendInfo;
   configure?(options: ModelOptions): Promise<void>;
   skills?(): Promise<RemoteSkill[]>;
+  messages?(): JsonObject[];
   prepareInput?(input: JsonObject[]): Promise<PreparedInput>;
   send(input: JsonObject[], options: { steer: boolean; model?: string; effort?: string }, prepared?: PreparedInput): Promise<void>;
   abort(): Promise<void>;
@@ -99,6 +100,8 @@ export class Sessions {
   private locks = new Map<string, Promise<unknown>>();
   private records = new Map<string, ThreadRecord>();
   private saveTimer?: NodeJS.Timeout;
+  private closing = false;
+  private starting = new Set<Promise<JsonObject>>();
   private dirty = new Set<string>();
   onNotify: (threadId: string | undefined, method: string, params: JsonObject) => void = () => {};
   readonly state: State;
@@ -108,7 +111,7 @@ export class Sessions {
     this.state = state; this.createBackend = createBackend; this.validateInput = validateInput;
     for (const record of state.list<ThreadRecord>("threads")) {
       record.thread.status = { type: "notLoaded" };
-      record.thread.canAcceptDirectInput = record.owner === "daemon";
+      record.thread.canAcceptDirectInput = record.owner === "daemon" || !!record.sessionFile;
       for (const turn of record.thread.turns) {
         for (const item of turn.items) {
           if (item.type === "userMessage") item.content = displayInput(item.content);
@@ -207,10 +210,16 @@ export class Sessions {
     return current;
   }
   async start(params: JsonObject): Promise<JsonObject> {
+    if (this.closing) throw new RpcError(-32600, "Remote is stopping. Reconnect before starting a conversation.");
+    const pending = this.startConversation(params); this.starting.add(pending);
+    try { return await pending; } finally { this.starting.delete(pending); }
+  }
+  private async startConversation(params: JsonObject): Promise<JsonObject> {
     validateExecutionOptions(params);
     const events: JsonObject[] = [];
     let id: string | undefined;
     const backend = await this.createBackend(undefined, params, event => id ? this.event(id, event) : events.push(event));
+    if (this.closing) { await backend.close(); throw new RpcError(-32600, "Remote stopped before the conversation could be opened."); }
     id = backend.info.id;
     if (this.records.has(id)) { await backend.close(); throw new Error("Duplicate Pi session identifier."); }
     const thread = makeThread(backend.info);
@@ -222,43 +231,54 @@ export class Sessions {
     return sessionResponse(this.read(id, false));
   }
   async resume(id: string): Promise<JsonObject> {
-    // Opening a detached terminal is a read operation, not permission to take over its execution.
-    // Keep the subscription alive so the desktop sees it become writable when Pi reconnects.
+    // Reading a terminal's history must not load extensions or start a background worker.
+    // Its saved session is claimed lazily when the user actually sends a message.
     if (this.record(id).owner !== "live" || this.backends.has(id)) await this.backend(id);
     return sessionResponse(this.read(id));
   }
   private async backend(id: string): Promise<Backend> {
+    if (this.closing) throw new RpcError(-32600, "Remote is stopping. Reconnect before sending another message.");
     const loaded = this.backends.get(id);
     if (loaded) return loaded;
     const record = this.record(id);
-    if (record.owner === "live") throw new RpcError(-32600, "Open this conversation in Pi to reconnect it. Remote will not start a second writer.");
+    if (record.owner === "live" && !record.sessionFile) throw new RpcError(-32600, "This conversation has no saved Pi session. Open it in Pi to reconnect it.");
     let pending = this.loading.get(id);
     if (!pending) {
-      pending = this.createBackend(record, {}, event => this.event(id, event)).then(backend => {
-        this.backends.set(id, backend); record.thread.status = { type: "idle" };
-        this.settingsChanged(id, backend.info); return backend;
+      pending = this.createBackend(record, {}, event => this.event(id, event)).then(async backend => {
+        if (this.closing) { await backend.close(); throw new RpcError(-32600, "Remote stopped before the conversation could be opened."); }
+        this.backends.set(id, backend); record.owner = "daemon"; record.thread.canAcceptDirectInput = true;
+        record.thread.status = { type: "idle" };
+        if (backend.messages) this.snapshot(id, backend.messages());
+        this.settingsChanged(id, backend.info); this.persist(id);
+        this.emit(id, "thread/status/changed", { threadId: id, status: record.thread.status });
+        return backend;
       }).finally(() => this.loading.delete(id));
       this.loading.set(id, pending);
     }
     return pending;
   }
-  attach(backend: Backend, messages: JsonObject[] = []): void {
+  async claimLocal(id: string, claim: () => void): Promise<void> {
+    return this.serial(id, async () => {
+      await this.loading.get(id);
+      if (this.closing) throw new RpcError(-32600, "Remote is stopping. Reopen the session after it restarts.");
+      const backend = this.backends.get(id);
+      if (this.active.has(id) || backend?.info.busy) throw new RpcError(-32600, "This conversation is still running. Wait for it to finish before reopening it in Pi.");
+      if (backend && this.record(id).owner === "live") throw new RpcError(-32600, "This conversation is already open in another Pi window.");
+      if (backend) { await backend.close(); this.backends.delete(id); }
+      claim();
+    });
+  }
+  attach(backend: Backend, messages: JsonObject[] = [], handoff = false): void {
     const id = backend.info.id;
-    if (this.backends.has(id)) throw new RpcError(-32600, "This conversation already has an execution owner.");
+    if (this.closing || this.backends.has(id) || this.loading.has(id)) throw new RpcError(-32600, "This conversation already has an execution owner.");
     const existing = this.records.get(id);
-    if (existing?.owner === "daemon") throw new RpcError(-32600, "This conversation belongs to the Remote worker. Resume it from a Codex App.");
+    if (existing?.owner === "daemon" && !handoff) throw new RpcError(-32600, "This conversation belongs to the Remote worker. Resume it from a Codex App.");
     const record = existing ?? { thread: makeThread(backend.info), owner: "live" as const, archived: false };
     this.records.set(id, record); this.backends.set(id, backend);
     record.thread.status = { type: backend.info.busy ? "active" : "idle", ...(backend.info.busy ? { activeFlags: [] } : {}) };
     record.thread.canAcceptDirectInput = true; record.sessionFile = backend.info.sessionFile;
-    const visible = messages.filter(message => ["user", "assistant"].includes(message.role));
-    const keys = visible.map(messageKey);
-    if (!existing || JSON.stringify(record.liveMessages ?? []) !== JSON.stringify(keys)) {
-      // Pi's current branch is authoritative after a disconnected terminal or a tree switch.
-      // Replaced turn IDs are not replayed: old input receipts explicitly require a fresh read.
-      this.active.delete(id); record.thread.turns = []; record.thread.preview = ""; record.liveMessages = [];
-      this.importHistory(id, visible);
-    }
+    record.owner = "live";
+    this.snapshot(id, messages);
     record.thread.model = backend.info.model; record.thread.modelProvider = backend.info.provider;
     record.thread.reasoningEffort = backend.info.effort; record.thread.name = backend.info.name ?? record.thread.name;
     if (backend.info.busy) this.ensureActive(id);
@@ -271,7 +291,7 @@ export class Sessions {
     this.backends.delete(id);
     this.finish(id, "interrupted", "The Pi terminal disconnected. No second writer was started.");
     const record = this.record(id);
-    record.thread.status = { type: "notLoaded" }; record.thread.canAcceptDirectInput = false;
+    record.thread.status = { type: "notLoaded" }; record.thread.canAcceptDirectInput = !!record.sessionFile;
     this.persist(id); this.emit(id, "thread/status/changed", { threadId: id, status: record.thread.status });
   }
   private ensureActive(id: string): Active {
@@ -376,8 +396,8 @@ export class Sessions {
   event(id: string, event: JsonObject): void {
     if (!this.records.has(id)) return;
     const record = this.record(id);
-    if (record.owner === "live" && (event.type === "message_start" && event.message?.role === "user" ||
-        event.type === "message_end" && event.message?.role === "assistant")) {
+    if (event.type === "message_start" && event.message?.role === "user" ||
+        event.type === "message_end" && event.message?.role === "assistant") {
       (record.liveMessages ??= []).push(messageKey(event.message));
     }
     if (event.type === "remote_settings_changed") {
@@ -471,6 +491,16 @@ export class Sessions {
     this.emit(id, "turn/completed", { threadId: id, turn: active.turn });
     this.emit(id, "thread/status/changed", { threadId: id, status: record.thread.status });
   }
+  private snapshot(id: string, messages: JsonObject[]): void {
+    const record = this.record(id);
+    const visible = messages.filter(message => ["user", "assistant"].includes(message.role));
+    const keys = visible.map(messageKey);
+    if (JSON.stringify(record.liveMessages ?? []) === JSON.stringify(keys)) return;
+    // The full saved Pi branch is authoritative, including work done while Remote was offline.
+    // Keep stable Remote turn IDs whenever the branch is unchanged.
+    this.active.delete(id); record.thread.turns = []; record.thread.preview = ""; record.liveMessages = [];
+    this.importHistory(id, visible);
+  }
   private importHistory(id: string, messages: JsonObject[]): void {
     // Only visible messages are projected; system prompts and provider signatures stay in Pi.
     const notify = this.onNotify; this.onNotify = () => {};
@@ -496,6 +526,8 @@ export class Sessions {
   }
   flush(): void { for (const id of [...this.dirty]) this.persist(id); }
   async close(): Promise<void> {
+    this.closing = true;
+    await Promise.allSettled([...this.starting, ...this.loading.values(), ...this.locks.values()]);
     clearTimeout(this.saveTimer);
     for (const backend of this.backends.values()) await backend.close();
     for (const id of [...this.active.keys()]) this.finish(id, "interrupted", "Remote stopped.");

@@ -14,6 +14,7 @@ import { AppServer } from "./server.js";
 import { Sessions, type Backend, type BackendFactory } from "./sessions.js";
 import type { RemoteSkill } from "./skills.js";
 import { State } from "./state.js";
+import { SessionOwners, sessionPath } from "./ownership.js";
 import { object, RpcError, text, type JsonObject } from "./types.js";
 
 export interface HostRuntime { credentials(): Promise<Credentials>; models(): Promise<JsonObject[]>; skills?(cwd: string): Promise<RemoteSkill[]>; createBackend: BackendFactory }
@@ -48,6 +49,7 @@ export async function startHost(config: RemoteConfig, createRuntime: (files: Hos
   const peers = new Set<Peer>();
   const sessions = new Sessions(state, runtime.createBackend, input => piInput(input, files));
   const api = new ControlApi(config, state, () => runtime.credentials());
+  const owners = new SessionOwners(config.database);
   let relay: Relay;
   const status = () => ({ state: "running", pid: process.pid, startedAt: endpoint.startedAt,
     status: relay.status, serverName: config.hostName, installationId: state.installationId(),
@@ -120,12 +122,26 @@ export async function startHost(config: RemoteConfig, createRuntime: (files: Hos
           setTimeout(() => { void close().finally(() => requestShutdown?.()); }, 50);
           return {};
         }
+        case "bridge/claim": {
+          const id = text(params.threadId, "session identifier", 512);
+          const token = text(params.token, "ownership token", 128);
+          if (!Number.isSafeInteger(params.pid) || params.pid <= 0) throw new RpcError(-32602, "Invalid Pi process.");
+          const file = params.sessionFile == null ? undefined : sessionPath(text(params.sessionFile, "session file"));
+          const record = state.get("threads", id);
+          if (record?.sessionFile && file !== sessionPath(record.sessionFile)) throw new RpcError(-32602, "Use this conversation's registered Pi session file.");
+          await sessions.claimLocal(id, () => { owners.claim(id, file, "live", token, params.pid); });
+          return {};
+        }
         case "bridge/register": {
           if (attached) throw new RpcError(-32600, "This Pi process is already registered.");
           const info = object(params.info);
           text(info.id, "session identifier", 512); text(info.cwd, "working directory");
           text(info.model, "model"); text(info.provider, "provider"); text(info.effort, "reasoning effort", 64);
           if (!Array.isArray(params.messages)) throw new RpcError(-32602, "Invalid session snapshot.");
+          const claim = params.owner == null ? undefined : object(params.owner);
+          if (claim) owners.assert({ id: info.id, file: info.sessionFile ? sessionPath(info.sessionFile) : undefined,
+            kind: "live", pid: claim.pid, token: claim.token });
+          else if (owners.known(info.id)) throw new RpcError(-32600, "Reload codex-ish in this Pi window before reconnecting the conversation.");
           // Only an authenticated LOCAL Pi process may add a root outside the home directory.
           await files.addRoot(info.cwd);
           state.set("host", "sharedRoots", [...files.roots]);
@@ -153,7 +169,7 @@ export async function startHost(config: RemoteConfig, createRuntime: (files: Hos
             abort: async () => { await peer.call("bridge/abort", { threadId: info.id }); },
             close: async () => {}, // Stopping Remote must not kill the user's terminal session.
           };
-          sessions.attach(backend, params.messages); attached = backend;
+          sessions.attach(backend, params.messages, !!claim); attached = backend;
           return { threadId: info.id };
         }
       }

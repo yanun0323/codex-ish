@@ -6,6 +6,7 @@ import type { Credentials } from "./control-api.js";
 import { HostFiles } from "./filesystem.js";
 import { deferred, object, RpcError, text, type JsonObject, type PreparedInput } from "./types.js";
 import type { Backend, BackendFactory } from "./sessions.js";
+import { SessionOwners, sessionHeader, type SessionOwner } from "./ownership.js";
 import { hostThinkingLevels, modelCatalog, reasoningEffort, resolveModel, thinkingLevel, validateModelOptions, type ModelOptions, type ThinkingLevels } from "./models.js";
 import { escapeAttribute, resourceSkills, skillBlock, type RemoteSkill } from "./skills.js";
 
@@ -65,15 +66,16 @@ export class PiRuntime {
   private config: RemoteConfig;
   private files: HostFiles;
   private levels: ThinkingLevels;
-  private constructor(sdk: JsonObject, modelsRuntime: JsonObject, config: RemoteConfig, files: HostFiles, levels: ThinkingLevels) {
-    this.sdk = sdk; this.modelsRuntime = modelsRuntime; this.config = config; this.files = files; this.levels = levels;
+  private owners: SessionOwners;
+  private constructor(sdk: JsonObject, modelsRuntime: JsonObject, config: RemoteConfig, files: HostFiles, levels: ThinkingLevels, owners: SessionOwners) {
+    this.sdk = sdk; this.modelsRuntime = modelsRuntime; this.config = config; this.files = files; this.levels = levels; this.owners = owners;
   }
-  static async create(config: RemoteConfig, files: HostFiles, sdkPath: string): Promise<PiRuntime> {
+  static async create(config: RemoteConfig, files: HostFiles, sdkPath: string, owners = new SessionOwners(config.database)): Promise<PiRuntime> {
     const sdk = await import(pathToFileURL(sdkPath).href);
     if (!sdk.ModelRuntime || !sdk.createAgentSession) throw new Error("The installed Pi SDK is not supported. Update Pi and rebuild codex-ish.");
     const models = await sdk.ModelRuntime.create({ authPath: join(config.agentDir, "auth.json"),
       modelsPath: join(config.agentDir, "models.json"), modelsStorePath: join(config.home, "models-cache.json"), allowModelNetwork: false });
-    return new PiRuntime(sdk, models, config, files, await hostThinkingLevels(sdkPath));
+    return new PiRuntime(sdk, models, config, files, await hostThinkingLevels(sdkPath), owners);
   }
   async credentials(): Promise<Credentials> {
     const stored = await this.modelsRuntime.listCredentials();
@@ -114,13 +116,31 @@ export class PiRuntime {
     return resourceSkills(loader.getSkills().skills);
   }
   readonly createBackend: BackendFactory = async (record, params, event) => {
+    let owner: SessionOwner | undefined;
+    let dispose: (() => Promise<void>) | undefined;
+    try {
     const cwd = await this.files.directory(record?.thread.cwd ?? params.cwd ?? this.config.userHome);
     const model = this.resolveModel(params.model ?? record?.thread.model);
     const sessionDir = join(this.config.home, "sessions");
     await mkdir(sessionDir, { recursive: true, mode: 0o700 });
-    const manager = record?.sessionFile ? this.sdk.SessionManager.open(record.sessionFile, sessionDir)
+    if (record) {
+      if (!record.sessionFile) throw new RpcError(-32600, "This conversation has no saved Pi session. Reopen it in Pi to continue.");
+      if (record.owner === "live") await this.owners.checkLegacy();
+      // Only an already registered local session can be reopened, never a caller-supplied path.
+      const header = sessionHeader(record.sessionFile);
+      if (header.id !== record.thread.id || await this.files.directory(header.cwd) !== cwd) throw new RpcError(-32600, "The saved Pi session does not match this conversation.");
+      owner = this.owners.claim(record.thread.id, record.sessionFile, "worker");
+    }
+    const manager = record ? this.sdk.SessionManager.open(record.sessionFile, sessionDir)
       : this.sdk.SessionManager.create(cwd, sessionDir);
+    owner ??= this.owners.claim(manager.getSessionId(), manager.getSessionFile(), "worker");
     if (record && manager.getSessionId() !== record.thread.id) throw new Error("Pi session identity changed.");
+    const cursor = this.owners.cursor(owner);
+    if (cursor === null) manager.resetLeaf();
+    else if (cursor !== undefined) {
+      if (!manager.getEntry(cursor)) throw new RpcError(-32600, "The saved Pi branch is unavailable. Reopen this conversation in Pi.");
+      manager.branch(cursor);
+    }
     if (!record && manager.getSessionFile()) {
       // Pi normally creates this file only after an assistant reply. Persist the new worker's
       // public session header now so an empty Remote conversation can survive a host restart.
@@ -132,9 +152,9 @@ export class PiRuntime {
     const { session } = await this.sdk.createAgentSession({ cwd, agentDir: this.config.agentDir, sessionManager: manager,
       modelRuntime: this.modelsRuntime, model, settingsManager: settings, resourceLoader: loader,
       ...(effort ? { thinkingLevel: thinkingLevel(effort) } : {}) });
-    if (!session.model) { session.dispose(); throw new RpcError(-32600, "Configure a model and login in Pi before starting a Remote conversation."); }
-    try { if (params.effort != null) validateModelOptions({ effort: params.effort }, session.model, this.levels); }
-    catch (error) { session.dispose(); throw error; }
+    dispose = async () => { session.clearQueue(); await session.abort(); session.dispose(); };
+    if (!session.model) throw new RpcError(-32600, "Configure a model and login in Pi before starting a Remote conversation.");
+    if (params.effort != null) validateModelOptions({ effort: params.effort }, session.model, this.levels);
     const info = { id: session.sessionId, cwd, sessionFile: session.sessionFile as string | undefined,
       model: `${session.model.provider}/${session.model.id}`, provider: session.model.provider, effort: session.thinkingLevel === "off" ? "none" : session.thinkingLevel };
     const sync = () => {
@@ -142,17 +162,23 @@ export class PiRuntime {
       info.effort = reasoningEffort(session.thinkingLevel);
       event({ type: "remote_settings_changed", info: { ...info } });
     };
+    let shutdown = false;
     const unsubscribe = session.subscribe((value: JsonObject) => {
       if (value.type === "thinking_level_changed" || value.type === "agent_settled") sync();
       event(value);
     });
-    try { await session.bindExtensions({ mode: "rpc", onError: () => {} }); }
-    catch (error) { unsubscribe(); session.dispose(); throw error; }
+    dispose = async () => {
+      session.clearQueue(); await session.abort();
+      if (!shutdown) { shutdown = true; await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" }); }
+      unsubscribe(); session.dispose();
+    };
+    await session.bindExtensions({ mode: "rpc", onError: () => {} });
     let closed = false;
     const skills = async () => resourceSkills(session.resourceLoader.getSkills().skills);
     const prepareInput = (input: JsonObject[]) => piInput(input, this.files, { cwd, skills });
     const configure = async (options: ModelOptions) => {
       if (closed) throw new RpcError(-32600, "This Pi worker has stopped.");
+      this.owners.assert(owner!);
       const nextModel = this.resolveModel(options.model) ?? session.model;
       validateModelOptions(options, nextModel, this.levels);
       if (!session.isIdle && (`${nextModel.provider}/${nextModel.id}` !== info.model || options.effort != null && options.effort !== info.effort)) {
@@ -164,6 +190,7 @@ export class PiRuntime {
     };
     return {
       info, skills, prepareInput, configure,
+      messages: () => manager.getBranch().filter((entry: JsonObject) => entry.type === "message" && ["user", "assistant"].includes(entry.message?.role)).map((entry: JsonObject) => entry.message),
       send: async (input, options, prepared) => {
         if (closed) throw new RpcError(-32600, "This Pi worker has stopped.");
         const parsed = prepared ?? await prepareInput(input);
@@ -184,7 +211,16 @@ export class PiRuntime {
         info.sessionFile = session.sessionFile;
       },
       abort: async () => { session.clearQueue(); await session.abort(); },
-      close: async () => { if (closed) return; closed = true; session.clearQueue(); await session.abort(); unsubscribe(); session.dispose(); },
+      close: async () => {
+        if (closed) return; closed = true;
+        // Do not release ownership until tools, queued work, and extensions have stopped.
+        await dispose!(); this.owners.release(owner!, manager.getLeafId());
+      },
     } satisfies Backend;
+    } catch (error) {
+      if (dispose) await dispose();
+      if (owner) this.owners.release(owner);
+      throw error;
+    }
   };
 }

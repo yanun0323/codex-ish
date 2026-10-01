@@ -22,7 +22,7 @@ test("the real local bridge switches models, tracks local thinking changes, and 
   const id = "actual-bridge-settings";
   const ctx = { cwd: config.userHome, model: first, thinkingLevel: "high", isIdle: () => idle,
     modelRegistry: { getAvailable: () => [first, second] }, ui: { notify() {}, requestRender() {} },
-    sessionManager: { getSessionId: () => id, getBranch: () => [], getSessionFile: () => undefined, getSessionName: () => undefined } };
+    sessionManager: { getSessionId: () => id, getBranch: () => [], getSessionFile: () => undefined, getSessionName: () => undefined, getLeafId: () => null } };
   const pi = { on: (name, handler) => handlers.set(name, handler), registerCommand() {},
     getCommands: () => [{ name: "skill:bridge", description: "fixture", source: "skill", sourceInfo: { path: skillPath, scope: "user" } }],
     getThinkingLevel: () => ctx.thinkingLevel,
@@ -33,7 +33,7 @@ test("the real local bridge switches models, tracks local thinking changes, and 
       handlers.get("message_start")({ type: "message_start", message: { role: "user", content } }, ctx);
     } };
   registerRemoteControl(pi, async () => { throw new Error("No real pairing"); });
-  f.cleanup.push(async () => handlers.get("session_shutdown")());
+  f.cleanup.push(async () => handlers.get("session_shutdown")({ type: "session_shutdown", reason: "quit" }, ctx));
   await handlers.get("session_start")({}, ctx); await eventually(() => host.sessions.loaded().includes(id));
   const phone = await client(host.app, "phone"); const mac = await client(host.app, "mac");
   await phone.send("thread/resume", { threadId: id }); await mac.send("thread/resume", { threadId: id });

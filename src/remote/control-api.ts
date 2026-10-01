@@ -4,7 +4,15 @@ import { APP_SERVER_VERSION } from "./version.js";
 import { RpcError, type JsonObject } from "./types.js";
 
 export interface Credentials { accessToken: string; accountId: string }
-export interface Enrollment { accountId: string; serverId: string; environmentId: string; serverName: string }
+export interface Enrollment {
+  accountId: string; serverId: string; environmentId: string; serverName: string;
+  appServerVersion?: string; os?: string; arch?: string;
+}
+/** Use Codex's platform names rather than Node's darwin/win32/arm64/x64 aliases. */
+export function enrollmentPlatform(platform: string = process.platform, arch: string = process.arch) {
+  return { os: platform === "darwin" ? "macos" : platform === "win32" ? "windows" : platform,
+    arch: arch === "arm64" ? "aarch64" : arch === "x64" ? "x86_64" : arch === "ia32" ? "x86" : arch };
+}
 export class BackendError extends Error {
   readonly status: number;
   readonly retryAt: number;
@@ -20,6 +28,7 @@ export function retryAfter(value: string | null, now = Date.now()): number {
 export class ControlApi {
   private token?: { value: string; expires: number };
   private pending?: Promise<Enrollment>;
+  private enrollmentError?: Error;
   retryAt = 0;
   readonly config: RemoteConfig;
   readonly state: State;
@@ -77,12 +86,17 @@ export class ControlApi {
   }
   private async loadEnrollment(): Promise<Enrollment> {
     const credentials = await this.identity();
+    if (this.enrollmentError) throw this.enrollmentError;
     let enrollment = this.enrollment;
-    if (enrollment && this.token && this.token.expires > Date.now() + 5 * 60_000) return enrollment;
+    if (enrollment && enrollment.accountId !== credentials.accountId) throw new RpcError(-32001, "Remote is registered to another ChatGPT account.");
+    const metadata = { name: this.config.hostName, ...enrollmentPlatform(), app_server_version: APP_SERVER_VERSION };
+    const metadataMatches = enrollment?.serverName === metadata.name && enrollment.appServerVersion === metadata.app_server_version
+      && enrollment.os === metadata.os && enrollment.arch === metadata.arch;
+    if (enrollment && metadataMatches && this.token && this.token.expires > Date.now() + 5 * 60_000) return enrollment;
     const installation = this.state.installationId();
     const headers = { "chatgpt-account-id": credentials.accountId, "x-codex-installation-id": installation };
     let response: JsonObject | undefined;
-    if (enrollment) {
+    if (enrollment && metadataMatches) {
       try {
         response = await this.request("server/refresh", "POST", credentials.accessToken,
           { server_id: enrollment.serverId, installation_id: installation }, headers);
@@ -92,22 +106,27 @@ export class ControlApi {
         enrollment = undefined;
       }
     }
+    // Refresh renews credentials only. Re-publish changed (or legacy, unversioned) metadata
+    // with the SAME installation ID. Never adopt a replacement identity during an upgrade.
     if (!response) response = await this.request("server/enroll", "POST", credentials.accessToken,
-      { name: this.config.hostName, os: process.platform === "win32" ? "windows" : process.platform,
-        arch: process.arch, app_server_version: APP_SERVER_VERSION, installation_id: installation }, headers);
+      { ...metadata, installation_id: installation }, headers);
     const expiry = Date.parse(response.expires_at);
-    if (typeof response.server_id !== "string" || typeof response.environment_id !== "string" ||
-        typeof response.remote_control_token !== "string" || !Number.isFinite(expiry) || expiry <= Date.now()) {
+    if (typeof response.server_id !== "string" || !response.server_id || typeof response.environment_id !== "string" || !response.environment_id ||
+        typeof response.remote_control_token !== "string" || !response.remote_control_token || !Number.isFinite(expiry) || expiry <= Date.now()) {
       throw new Error("Remote service returned an invalid enrollment.");
     }
     if (enrollment && (response.server_id !== enrollment.serverId || response.environment_id !== enrollment.environmentId)) {
-      throw new Error("Remote service changed the host identity during refresh.");
+      this.token = undefined;
+      // Stop automatic retries as well: a repeated enroll must not create more registrations.
+      this.enrollmentError = new RpcError(-32600, "Remote service changed the host identity. Saved host details were left unchanged. Check the host registration before restarting Remote.");
+      throw this.enrollmentError;
     }
     // Recheck identity after network waits; never publish credentials belonging to a former login.
     const latest = await this.identity();
     if (latest.accountId !== credentials.accountId) throw new Error("ChatGPT account changed.");
     enrollment = { accountId: credentials.accountId, serverId: response.server_id,
-      environmentId: response.environment_id, serverName: this.config.hostName };
+      environmentId: response.environment_id, serverName: metadata.name,
+      appServerVersion: metadata.app_server_version, os: metadata.os, arch: metadata.arch };
     this.state.set("host", "enrollment", enrollment);
     this.token = { value: response.remote_control_token, expires: expiry };
     return enrollment;
