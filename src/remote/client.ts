@@ -1,13 +1,14 @@
 import { spawn, execFile } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { config, type RemoteConfig } from "./config.js";
 import { connectLocal, localCall, type Peer } from "./ipc.js";
 import { delay, errorMessage, RpcError, type JsonObject } from "./types.js";
+import { hostModulePath, hostThinkingLevels, modelCatalog, reasoningEffort, resolveModel, thinkingLevel, validateModelOptions, type ModelOptions, type ThinkingLevels } from "./models.js";
+import { commandSkills } from "./skills.js";
 
 const exec = promisify(execFile);
 function hostSdk(): string {
@@ -20,7 +21,7 @@ function hostSdk(): string {
       if (existsSync(candidate) && directory.includes("pi-coding-agent")) return candidate;
     } catch { /* Fall through to normal package resolution. */ }
   }
-  return createRequire(import.meta.url).resolve("@earendil-works/pi-coding-agent");
+  return hostModulePath("@earendil-works/pi-coding-agent", fileURLToPath(import.meta.url));
 }
 async function legacyPid(cfg: RemoteConfig): Promise<number | undefined> {
   try {
@@ -92,6 +93,28 @@ export function registerRemoteControl(pi: any, showPairing: (ctx: any, pairing: 
   let capturing = false;
   let pendingEvents: JsonObject[] = [];
   let pendingBytes = 0;
+  let levels: ThinkingLevels | undefined;
+  const modelInfo = () => ({ model: `${ctx.model?.provider ?? "pi"}/${ctx.model?.id ?? "unconfigured"}`,
+    provider: ctx.model?.provider ?? "pi", effort: reasoningEffort(pi.getThinkingLevel?.() ?? ctx.thinkingLevel ?? "off") });
+  const catalog = async () => {
+    const available = await ctx.modelRegistry?.getAvailable() ?? [];
+    const models = [...new Map([...available, ...(ctx.model ? [ctx.model] : [])]
+      .map((model: JsonObject) => [`${model.provider}/${model.id}`, model])).values()] as JsonObject[];
+    return modelCatalog(models, levels!, modelInfo().model);
+  };
+  const configure = async (options: ModelOptions) => {
+    const current = modelInfo();
+    const changing = options.model != null && options.model !== current.model || options.effort != null && options.effort !== current.effort;
+    if (changing && !ctx.isIdle()) throw new RpcError(-32602, "Wait for Pi to finish before changing its model or thinking level.");
+    const model = options.model == null || options.model === current.model ? ctx.model
+      : resolveModel(await ctx.modelRegistry.getAvailable(), options.model);
+    if (!model) throw new RpcError(-32602, "Select a model in Pi before changing this conversation's settings.");
+    validateModelOptions(options, model, levels!);
+    if (`${model.provider}/${model.id}` !== current.model && !await pi.setModel(model)) {
+      throw new RpcError(-32602, "Pi could not select this model. Check its login in Pi.");
+    }
+    if (options.effort != null) pi.setThinkingLevel(thinkingLevel(options.effort));
+  };
   const currentId = () => ctx?.sessionManager.getSessionId();
   const update = (status: JsonObject) => { state = status.status ?? "disabled"; ctx?.ui.requestRender?.(); };
   const stopBridge = () => { generation++; registered = false; capturing = false; pendingEvents = []; pendingBytes = 0; reconnect?.abort(); peer?.close(); peer = undefined; };
@@ -109,26 +132,25 @@ export function registerRemoteControl(pi: any, showPairing: (ctx: any, pairing: 
       while (!controller.signal.aborted && epoch === generation) {
         let connection: Peer | undefined;
         try {
+          levels ??= await hostThinkingLevels(hostSdk());
           const threadId = currentId();
           connection = await connectLocal(cfg, async (method, params) => {
             if (epoch !== generation || params.threadId !== currentId() || params.threadId !== threadId) throw new RpcError(-32600, "Pi switched conversations. Resume the new conversation before sending a message.");
             if (method === "bridge/abort") { ctx.abort(); return {}; }
-            if (method !== "bridge/input") throw new RpcError(-32601, "Unknown Pi bridge request.");
-            if (params.model && params.model !== `${ctx.model?.provider}/${ctx.model?.id}`) {
-              if (!ctx.isIdle()) throw new RpcError(-32600, "Wait for Pi to finish before changing its model.");
-              const model = ctx.modelRegistry.getAvailable().find((value: JsonObject) => `${value.provider}/${value.id}` === params.model || value.id === params.model);
-              if (!model) throw new RpcError(-32602, "Model not found in this Pi session.");
-              if (!await pi.setModel(model)) throw new RpcError(-32602, "Pi could not select this model. Check its login in Pi.");
+            if (method === "bridge/skills") return { skills: commandSkills(pi.getCommands?.() ?? []) };
+            if (method === "bridge/settings") {
+              await configure(params);
+              return { info: { ...modelInfo(), models: await catalog() } };
             }
-            if (params.effort && ctx.isIdle()) pi.setThinkingLevel(params.effort === "none" ? "off" : params.effort);
+            if (method !== "bridge/input") throw new RpcError(-32601, "Unknown Pi bridge request.");
+            await configure(params);
             const content = [{ type: "text", text: params.text }, ...(params.images ?? [])];
             // Acknowledgement is not task completion; agent_settled is forwarded separately.
             const sent = pi.sendUserMessage(content, { deliverAs: params.steer ? "steer" : "followUp", expandPromptTemplates: false });
             void Promise.resolve(sent).catch(() => {
               try { connection?.notify("bridge/event", { threadId, event: { type: "remote_input_error" } }); } catch { /* Already disconnected. */ }
             });
-            return { accepted: true, info: { model: `${ctx.model?.provider ?? "pi"}/${ctx.model?.id ?? "unconfigured"}`,
-              provider: ctx.model?.provider ?? "pi", effort: ctx.thinkingLevel === "off" ? "none" : ctx.thinkingLevel ?? "medium" } };
+            return { accepted: true, info: modelInfo() };
           });
           if (controller.signal.aborted || epoch !== generation) { connection.close(); return; }
           peer = connection;
@@ -137,8 +159,7 @@ export function registerRemoteControl(pi: any, showPairing: (ctx: any, pairing: 
           const snapshot = visibleSnapshot(context);
           if (Buffer.byteLength(JSON.stringify(snapshot)) > 20 * 1024 * 1024) throw new Error("This conversation is too large to attach to Remote. Start a new Pi conversation.");
           await connection.call("bridge/register", { info: { id: threadId, cwd: context.cwd,
-            model: `${context.model?.provider ?? "pi"}/${context.model?.id ?? "unconfigured"}`,
-            provider: context.model?.provider ?? "pi", effort: context.thinkingLevel === "off" ? "none" : context.thinkingLevel ?? "medium",
+            ...modelInfo(), models: await catalog(),
             sessionFile: context.sessionManager.getSessionFile(), name: context.sessionManager.getSessionName(), busy: !context.isIdle() }, messages: snapshot });
           if (controller.signal.aborted || epoch !== generation) { connection.close(); return; }
           registered = true; lastBridgeError = undefined; capturing = false;
@@ -159,6 +180,24 @@ export function registerRemoteControl(pi: any, showPairing: (ctx: any, pairing: 
     await startBridge(context, process.env.PI_CODEX_APP_SERVER_AUTOSTART !== "0");
   });
   pi.on("session_shutdown", () => stopBridge());
+  for (const name of ["model_select", "thinking_level_select"]) {
+    pi.on(name, async (_event: JsonObject, context: any) => {
+      if (!peer || (!registered && !capturing) || context.sessionManager.getSessionId() !== currentId()) return;
+      ctx = context;
+      const epoch = generation;
+      const models = await catalog();
+      if (epoch !== generation || !peer || (!registered && !capturing)) return;
+      const event = { type: "remote_settings_changed", info: { ...modelInfo(), models } };
+      try {
+        if (registered) peer.notify("bridge/event", { threadId: currentId(), event });
+        else {
+          pendingBytes += Buffer.byteLength(JSON.stringify(event));
+          if (pendingBytes > 4 * 1024 * 1024) { peer.close(); return; }
+          pendingEvents.push(event);
+        }
+      } catch { peer.close(); }
+    });
+  }
   pi.on("session_tree", async (_event: unknown, context: any) => { await startBridge(context, false); });
   for (const name of ["agent_start", "agent_settled", "message_start", "message_update", "message_end", "tool_execution_start", "tool_execution_update", "tool_execution_end", "session_info_changed"]) {
     pi.on(name, (event: JsonObject, context: any) => {

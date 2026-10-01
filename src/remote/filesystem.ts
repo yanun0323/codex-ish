@@ -1,5 +1,5 @@
 import { constants } from "node:fs";
-import { lstat, mkdir, open, readdir, realpath, stat } from "node:fs/promises";
+import { lstat, mkdir, open, opendir, readdir, realpath, stat } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { RpcError, text } from "./types.js";
@@ -72,6 +72,35 @@ export class HostFiles {
       } catch { /* Protected, dangling, or inaccessible children are not exposed. */ }
     }
     return { entries };
+  }
+  /** Bounded filename discovery. Every result uses the browser's existing path checks. */
+  async *walk(root: string, signal: AbortSignal): AsyncGenerator<{ path: string; fileName: string; isDirectory: boolean }> {
+    const skip = new Set([".git", ".hg", ".svn", "node_modules", ".next", ".pnpm-store", ".yarn", ".turbo", "dist", "build", "coverage"]);
+    const pending = [root];
+    const visited = new Set<string>();
+    const deadline = Date.now() + 5000;
+    let remaining = 20_000;
+    while (pending.length && remaining > 0 && Date.now() < deadline && !signal.aborted) {
+      const directory = pending.shift()!;
+      try {
+        const canonical = await this.directory(directory);
+        if (visited.has(canonical)) continue;
+        visited.add(canonical);
+        const handle = await opendir(canonical);
+        for await (const entry of handle) {
+          if (signal.aborted || --remaining < 0 || Date.now() >= deadline) return;
+          if (skip.has(entry.name)) continue;
+          const child = join(directory, entry.name);
+          try {
+            const allowed = await this.existing(child);
+            const info = entry.isSymbolicLink() ? await stat(allowed) : entry;
+            if (!info.isDirectory() && !info.isFile()) continue;
+            yield { path: relative(root, child), fileName: entry.name, isDirectory: info.isDirectory() };
+            if (info.isDirectory() && !entry.isSymbolicLink() && pending.length < 2000) pending.push(child);
+          } catch { /* Protected, inaccessible, or vanished entries are not exposed. */ }
+        }
+      } catch { /* A directory may disappear while a query is running. */ }
+    }
   }
   async metadata(value: unknown) {
     const input = this.input(value);

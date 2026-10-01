@@ -1,16 +1,23 @@
 import { mkdir, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { RemoteConfig } from "./config.js";
 import type { Credentials } from "./control-api.js";
 import { HostFiles } from "./filesystem.js";
-import { deferred, RpcError, text, type JsonObject } from "./types.js";
+import { deferred, object, RpcError, text, type JsonObject, type PreparedInput } from "./types.js";
 import type { Backend, BackendFactory } from "./sessions.js";
+import { hostThinkingLevels, modelCatalog, reasoningEffort, resolveModel, thinkingLevel, validateModelOptions, type ModelOptions, type ThinkingLevels } from "./models.js";
+import { escapeAttribute, resourceSkills, skillBlock, type RemoteSkill } from "./skills.js";
 
-export async function piInput(input: JsonObject[], files: HostFiles) {
+export async function piInput(input: JsonObject[], files: HostFiles,
+  options: { cwd?: string; skills?: () => Promise<RemoteSkill[]> } = {}): Promise<PreparedInput> {
   const parts: string[] = [];
-  const images: { data: string; mimeType: string; type: "image" }[] = [];
-  for (const item of input) {
+  const blocks: string[] = [];
+  const selected = new Set<string>();
+  let skills: RemoteSkill[] | undefined;
+  const images: PreparedInput["images"] = [];
+  for (const raw of input) {
+    const item = object(raw);
     if (item.type === "text") {
       if (typeof item.text !== "string" || item.text.length > 1024 * 1024) throw new RpcError(-32602, "Invalid text input.");
       parts.push(item.text);
@@ -29,10 +36,26 @@ export async function piInput(input: JsonObject[], files: HostFiles) {
         : bytes.toString("ascii", 0, 3) === "GIF" ? "image/gif" : undefined;
       if (!mime) throw new RpcError(-32602, "Unsupported image format.");
       images.push({ type: "image", data: bytes.toString("base64"), mimeType: mime });
-    } else throw new RpcError(-32602, `Input type ${String(item.type)} is not supported. Use text or images.`);
+    } else if (item.type === "skill" && options.skills) {
+      skills ??= await options.skills();
+      const key = JSON.stringify([item.name, item.path]);
+      if (!selected.has(key)) { blocks.push(await skillBlock(item, skills)); selected.add(key); }
+    } else if (item.type === "mention") {
+      text(item.name, "mention name", 512);
+      const requested = text(item.path, "mention path");
+      if (!isAbsolute(requested) && !requested.startsWith("file:") && (!options.cwd || /^[a-z][a-z0-9+.-]*:/i.test(requested))) {
+        throw new RpcError(-32602, "Select a local file or directory from the file search.");
+      }
+      const path = await files.existing(isAbsolute(requested) || requested.startsWith("file:") ? requested : resolve(options.cwd!, requested));
+      const metadata = await files.metadata(path);
+      if (!metadata.isDirectory && !metadata.isFile) throw new RpcError(-32602, "Select a regular file or directory.");
+      parts.push(`<file_reference path="${escapeAttribute(path)}" />`);
+    } else throw new RpcError(-32602, `Input type ${String(item.type)} is not supported. Use text, images, or an available skill or file.`);
   }
-  if (!parts.some(part => part.trim()) && !images.length) throw new RpcError(-32602, "Enter a message or attach an image.");
-  return { text: parts.join("\n"), images };
+  if (!parts.some(part => part.trim()) && !images.length && !blocks.length) throw new RpcError(-32602, "Enter a message or attach an image.");
+  const value = [...blocks, ...parts].join("\n\n");
+  if (Buffer.byteLength(value) > 1024 * 1024) throw new RpcError(-32602, "This message and its selected skills exceed 1 MiB. Select fewer skills.");
+  return { text: blocks.length ? value : parts.join("\n"), images };
 }
 
 /** Resolve the host's SDK, not a second Pi installation hidden in a dependency. */
@@ -41,15 +64,16 @@ export class PiRuntime {
   private modelsRuntime: JsonObject;
   private config: RemoteConfig;
   private files: HostFiles;
-  private constructor(sdk: JsonObject, modelsRuntime: JsonObject, config: RemoteConfig, files: HostFiles) {
-    this.sdk = sdk; this.modelsRuntime = modelsRuntime; this.config = config; this.files = files;
+  private levels: ThinkingLevels;
+  private constructor(sdk: JsonObject, modelsRuntime: JsonObject, config: RemoteConfig, files: HostFiles, levels: ThinkingLevels) {
+    this.sdk = sdk; this.modelsRuntime = modelsRuntime; this.config = config; this.files = files; this.levels = levels;
   }
   static async create(config: RemoteConfig, files: HostFiles, sdkPath: string): Promise<PiRuntime> {
     const sdk = await import(pathToFileURL(sdkPath).href);
     if (!sdk.ModelRuntime || !sdk.createAgentSession) throw new Error("The installed Pi SDK is not supported. Update Pi and rebuild codex-ish.");
     const models = await sdk.ModelRuntime.create({ authPath: join(config.agentDir, "auth.json"),
       modelsPath: join(config.agentDir, "models.json"), modelsStorePath: join(config.home, "models-cache.json"), allowModelNetwork: false });
-    return new PiRuntime(sdk, models, config, files);
+    return new PiRuntime(sdk, models, config, files, await hostThinkingLevels(sdkPath));
   }
   async credentials(): Promise<Credentials> {
     const stored = await this.modelsRuntime.listCredentials();
@@ -70,21 +94,24 @@ export class PiRuntime {
     return { accessToken, accountId };
   }
   async models(): Promise<JsonObject[]> {
-    const available = await this.modelsRuntime.getAvailable();
-    return available.map((model: JsonObject, index: number) => ({ id: `${model.provider}/${model.id}`, model: `${model.provider}/${model.id}`,
-      displayName: model.name ?? model.id, description: `${model.provider} · Pi`, hidden: false,
-      upgrade: null, upgradeInfo: null, availabilityNux: null, modelSpecialty: null,
-      supportedReasoningEfforts: (model.reasoning ? ["minimal", "low", "medium", "high"] : ["none"])
-        .map(reasoningEffort => ({ reasoningEffort, description: reasoningEffort })),
-      defaultReasoningEffort: model.reasoning ? "medium" : "none", inputModalities: model.input ?? ["text"],
-      supportsPersonality: false, multiAgentVersion: null, additionalSpeedTiers: [], serviceTiers: [],
-      defaultServiceTier: null, availableAccessPrograms: null, isDefault: index === 0 }));
+    return modelCatalog(await this.modelsRuntime.getAvailable(), this.levels);
   }
   private resolveModel(name: string | undefined): JsonObject | undefined {
     if (!name) return undefined;
-    const model = this.modelsRuntime.getModels().find((value: JsonObject) => `${value.provider}/${value.id}` === name || value.id === name);
-    if (!model) throw new RpcError(-32602, "Model not found. Refresh the model list.");
-    return model;
+    return resolveModel(this.modelsRuntime.getModels(), name);
+  }
+  private async resources(cwd: string, discovery = false) {
+    const settings = this.sdk.SettingsManager.create(cwd, this.config.agentDir, { projectTrusted: false });
+    const loader = new this.sdk.DefaultResourceLoader({ cwd, agentDir: this.config.agentDir, settingsManager: settings,
+      ...(discovery ? { noExtensions: true, noPromptTemplates: true, noThemes: true, noContextFiles: true } : {}) });
+    // Honor saved local trust decisions. Remote cannot grant trust or answer a trust prompt.
+    await loader.reload({ resolveProjectTrust: async () => new this.sdk.ProjectTrustStore(this.config.agentDir).get(cwd)
+      ?? settings.getDefaultProjectTrust() === "always" });
+    return { settings, loader };
+  }
+  async skills(cwd: string): Promise<RemoteSkill[]> {
+    const { loader } = await this.resources(await this.files.directory(cwd), true);
+    return resourceSkills(loader.getSkills().skills);
   }
   readonly createBackend: BackendFactory = async (record, params, event) => {
     const cwd = await this.files.directory(record?.thread.cwd ?? params.cwd ?? this.config.userHome);
@@ -99,30 +126,48 @@ export class PiRuntime {
       // public session header now so an empty Remote conversation can survive a host restart.
       await writeFile(manager.getSessionFile(), JSON.stringify(manager.getHeader()) + "\n", { flag: "wx", mode: 0o600 });
     }
-    const settings = this.sdk.SettingsManager.create(cwd, this.config.agentDir);
-    const loader = new this.sdk.DefaultResourceLoader({ cwd, agentDir: this.config.agentDir, settingsManager: settings });
-    // Existing Pi trust decisions remain authoritative. Remote must not silently trust downloaded project code.
-    await loader.reload({ resolveProjectTrust: async () => false });
+    const { settings, loader } = await this.resources(cwd);
+    const effort = params.effort ?? record?.thread.reasoningEffort;
+    if (model && params.effort != null) validateModelOptions({ effort: params.effort }, model, this.levels);
     const { session } = await this.sdk.createAgentSession({ cwd, agentDir: this.config.agentDir, sessionManager: manager,
       modelRuntime: this.modelsRuntime, model, settingsManager: settings, resourceLoader: loader,
-      ...((params.effort ?? record?.thread.reasoningEffort) ? { thinkingLevel: (params.effort ?? record?.thread.reasoningEffort) === "none" ? "off" : params.effort ?? record?.thread.reasoningEffort } : {}) });
+      ...(effort ? { thinkingLevel: thinkingLevel(effort) } : {}) });
     if (!session.model) { session.dispose(); throw new RpcError(-32600, "Configure a model and login in Pi before starting a Remote conversation."); }
+    try { if (params.effort != null) validateModelOptions({ effort: params.effort }, session.model, this.levels); }
+    catch (error) { session.dispose(); throw error; }
     const info = { id: session.sessionId, cwd, sessionFile: session.sessionFile as string | undefined,
       model: `${session.model.provider}/${session.model.id}`, provider: session.model.provider, effort: session.thinkingLevel === "off" ? "none" : session.thinkingLevel };
-    const unsubscribe = session.subscribe((value: JsonObject) => event(value));
+    const sync = () => {
+      info.model = `${session.model.provider}/${session.model.id}`; info.provider = session.model.provider;
+      info.effort = reasoningEffort(session.thinkingLevel);
+      event({ type: "remote_settings_changed", info: { ...info } });
+    };
+    const unsubscribe = session.subscribe((value: JsonObject) => {
+      if (value.type === "thinking_level_changed" || value.type === "agent_settled") sync();
+      event(value);
+    });
     try { await session.bindExtensions({ mode: "rpc", onError: () => {} }); }
     catch (error) { unsubscribe(); session.dispose(); throw error; }
     let closed = false;
+    const skills = async () => resourceSkills(session.resourceLoader.getSkills().skills);
+    const prepareInput = (input: JsonObject[]) => piInput(input, this.files, { cwd, skills });
+    const configure = async (options: ModelOptions) => {
+      if (closed) throw new RpcError(-32600, "This Pi worker has stopped.");
+      const nextModel = this.resolveModel(options.model) ?? session.model;
+      validateModelOptions(options, nextModel, this.levels);
+      if (!session.isIdle && (`${nextModel.provider}/${nextModel.id}` !== info.model || options.effort != null && options.effort !== info.effort)) {
+        throw new RpcError(-32602, "Wait for Pi to finish before changing its model or thinking level.");
+      }
+      if (`${nextModel.provider}/${nextModel.id}` !== info.model) await session.setModel(nextModel, { persist: false });
+      if (options.effort != null) session.setThinkingLevel(thinkingLevel(options.effort), { persist: false });
+      sync();
+    };
     return {
-      info,
-      send: async (input, options) => {
+      info, skills, prepareInput, configure,
+      send: async (input, options, prepared) => {
         if (closed) throw new RpcError(-32600, "This Pi worker has stopped.");
-        const parsed = await piInput(input, this.files);
-        const nextModel = this.resolveModel(options.model);
-        if (nextModel) await session.setModel(nextModel, { persist: false });
-        if (options.effort) session.setThinkingLevel(options.effort === "none" ? "off" : options.effort);
-        info.model = `${session.model.provider}/${session.model.id}`; info.provider = session.model.provider;
-        info.effort = session.thinkingLevel === "off" ? "none" : session.thinkingLevel;
+        const parsed = prepared ?? await prepareInput(input);
+        await configure(options);
         if (options.steer) {
           if (await session.steer(parsed.text, parsed.images) === "handled") throw new RpcError(-32600, "A Pi extension handled this input outside the shared conversation.");
           return;

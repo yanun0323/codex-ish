@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import Ajv from "ajv";
-import { fixture, client, input } from "./remote-helpers.mjs";
+import { fixture, client, input, eventually } from "./remote-helpers.mjs";
 
 const contracts = JSON.parse(await readFile(new URL("./fixtures/codex/contracts.json", import.meta.url), "utf8"));
 const ajv = new Ajv({ strict: false, allErrors: true, validateFormats: false });
@@ -58,6 +58,36 @@ test("implemented responses match the pinned upstream Codex schemas", async t =>
   ]) {
     const response = await c.send(method, params); assert.ok(response.result, JSON.stringify(response)); valid(schema, response.result);
   }
+});
+
+test("model settings, skill discovery, and filename search match the pinned upstream contracts", async t => {
+  const validators = new Map();
+  for (const name of ["ThreadSettingsUpdatedNotification", "SkillsListResponse", "FuzzyFileSearchResponse",
+    "FuzzyFileSearchSessionUpdatedNotification", "FuzzyFileSearchSessionCompletedNotification"]) {
+    const schema = JSON.parse(await readFile(new URL(`./fixtures/codex/${name}.json`, import.meta.url), "utf8"));
+    validators.set(name, ajv.compile(schema));
+  }
+  const check = (name, value) => {
+    const validate = validators.get(name);
+    assert.ok(validate(value), `${name}: ${JSON.stringify(validate.errors)}`);
+  };
+  const { app, config } = await fixture(t); const c = await client(app, "app");
+  const path = join(config.userHome, "SKILL.md"); await writeFile(path, "fixture");
+  await mkdir(join(config.userHome, "skill-folder"));
+  app.options.skills = async () => [{ name: "test", path, description: "Test skill", scope: "user" }];
+  check("SkillsListResponse", (await c.send("skills/list", { cwds: [config.userHome] })).result);
+  check("FuzzyFileSearchResponse", (await c.send("fuzzyFileSearch", { query: "skill", roots: [config.userHome] })).result);
+  await c.send("fuzzyFileSearch/sessionStart", { sessionId: "schema", roots: [config.userHome] });
+  await c.send("fuzzyFileSearch/sessionUpdate", { sessionId: "schema", query: "skill" });
+  await eventually(() => c.events("fuzzyFileSearch/sessionCompleted").length);
+  check("FuzzyFileSearchSessionUpdatedNotification", c.events("fuzzyFileSearch/sessionUpdated")[0].params);
+  check("FuzzyFileSearchSessionCompletedNotification", c.events("fuzzyFileSearch/sessionCompleted")[0].params);
+  const { result: { thread } } = await c.send("thread/start", { cwd: config.userHome });
+  await c.send("thread/settings/update", { threadId: thread.id, effort: "xhigh" });
+  check("ThreadSettingsUpdatedNotification", c.events("thread/settings/updated")[0].params);
+  valid("ThreadResumeResponse", (await c.send("thread/resume", { threadId: thread.id })).result);
+  valid("ThreadItem", { type: "userMessage", id: "selected", clientId: null,
+    content: [{ type: "skill", name: "test", path }, { type: "mention", name: "folder", path: join(config.userHome, "skill-folder") }] });
 });
 
 test("streamed text, reasoning, tools, and turn events match upstream notification schemas", async t => {

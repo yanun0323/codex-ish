@@ -3,6 +3,9 @@ import { pathToFileURL } from "node:url";
 import type { RemoteConfig } from "./config.js";
 import type { ControlApi } from "./control-api.js";
 import { HostFiles } from "./filesystem.js";
+import { FileSearch } from "./search.js";
+import { skillMetadata, type RemoteSkill } from "./skills.js";
+import { RemoteDiagnostics } from "./diagnostics.js";
 import { Sessions, validateExecutionOptions } from "./sessions.js";
 import { State } from "./state.js";
 import { APP_SERVER_USER_AGENT } from "./version.js";
@@ -13,31 +16,42 @@ export interface Client {
   id: string; deviceId: string; initialized: boolean; ready: boolean; experimental: boolean;
   subscriptions: Set<string>; optOut: Set<string>; warnings: Set<string>; send: (message: RpcMessage) => void;
   requests: Map<string, { signature: string; promise: Promise<RpcMessage>; size: number }>;
+  search: FileSearch;
+  activeThread?: string;
 }
 interface ServerOptions {
   config: RemoteConfig; state: State; files: HostFiles; sessions: Sessions;
   models: () => Promise<JsonObject[]>;
+  skills?: (cwd: string) => Promise<RemoteSkill[]>;
   remoteStatus?: () => JsonObject;
   control?: ControlApi;
   revoke?: (clientId: string) => void;
+  diagnostics?: RemoteDiagnostics;
 }
 
 /** The public surface is an explicit allowlist. Internal IPC is never routed here. */
 export class AppServer {
   readonly clients = new Map<string, Client>();
   readonly options: ServerOptions;
+  readonly diagnostics: RemoteDiagnostics;
   constructor(options: ServerOptions) {
     this.options = options;
+    this.diagnostics = options.diagnostics ?? new RemoteDiagnostics(options.config);
     options.sessions.onNotify = (threadId, method, params) => this.notify(threadId, method, params);
   }
   connect(id: string, deviceId: string, send: Client["send"]): Client {
     let client = this.clients.get(id);
     if (client) { client.send = send; return client; }
     if (this.clients.size >= 128) throw new Error("Too many clients.");
-    client = { id, deviceId, send, initialized: false, ready: false, experimental: false, subscriptions: new Set(), optOut: new Set(), warnings: new Set(), requests: new Map() };
+    client = { id, deviceId, send, initialized: false, ready: false, experimental: false, subscriptions: new Set(), optOut: new Set(), warnings: new Set(), requests: new Map(),
+      search: new FileSearch(this.options.files, (method, params) => {
+        if (this.clients.get(id) === client && client!.ready && !client!.optOut.has(method)) {
+          try { client!.send({ method, params }); } catch { this.disconnect(id); }
+        }
+      }) };
     this.clients.set(id, client); return client;
   }
-  disconnect(id: string): void { this.clients.delete(id); }
+  disconnect(id: string): void { this.clients.get(id)?.search.close(); this.clients.delete(id); }
   notify(threadId: string | undefined, method: string, params: JsonObject): void {
     for (const client of [...this.clients.values()]) {
       if (!client.ready || client.optOut.has(method) || threadId && !client.subscriptions.has(threadId)) continue;
@@ -45,8 +59,15 @@ export class AppServer {
     }
   }
   async receive(client: Client, message: RpcMessage): Promise<void> {
+    const started = Date.now();
+    this.diagnostics.request(message, client.id);
+    const send = (response: RpcMessage, replayed = false) => {
+      this.diagnostics.response(message, client.id, response, started, replayed);
+      try { client.send(response); }
+      catch (error) { this.diagnostics.failure("response/send_error", error, message, client.id); throw error; }
+    };
     if (typeof message.method !== "string" || message.method.length > 256) {
-      if (message.id != null) client.send(responseError(message.id, new RpcError(-32600, "Invalid request.")));
+      if (message.id != null) send(responseError(message.id, new RpcError(-32600, "Invalid request.")));
       return;
     }
     // Older clients may send initialized; desktop proceeds after the initialize response.
@@ -56,19 +77,20 @@ export class AppServer {
     const key = `${typeof message.id}:${String(message.id)}`;
     const signature = createHash("sha256").update(JSON.stringify([message.method, message.params])).digest("hex");
     let request = client.requests.get(key);
-    if (request && request.signature !== signature) { client.send(responseError(message.id, new RpcError(-32600, "Request identifier was reused with different parameters."))); return; }
+    if (request && request.signature !== signature) { send(responseError(message.id, new RpcError(-32600, "Request identifier was reused with different parameters."))); return; }
+    const replayed = !!request;
     if (!request) {
       const id = message.id;
       const promise = Promise.resolve().then(async (): Promise<RpcMessage> => {
         try { return { id, result: await this.dispatch(client, message.method!, object(message.params ?? {}), key) }; }
-        catch (error) { return responseError(id, error); }
+        catch (error) { this.diagnostics.failure("request/error", error, message, client.id); return responseError(id, error); }
       });
       request = { signature, promise, size: 0 };
       client.requests.set(key, request);
       void promise.then(value => { request!.size = Buffer.byteLength(JSON.stringify(value)); });
     }
     const response = await request.promise;
-    client.send(response);
+    send(response, replayed);
     // Enable notifications only after the successful initialize response has been sent.
     if (message.method === "initialize" && !response.error) client.ready = true;
     // Bound replay caches by bytes as well as request count. Turn idempotency lives in durable storage.
@@ -93,7 +115,7 @@ export class AppServer {
         platformFamily: process.platform === "win32" ? "windows" : "unix", platformOs: process.platform === "darwin" ? "macos" : process.platform };
     }
     if (!client.initialized) throw new RpcError(-32600, "Send initialize before making requests.");
-    if (["thread/start", "thread/resume", "turn/start", "turn/steer"].includes(method)) {
+    if (["thread/start", "thread/resume", "thread/settings/update", "turn/start", "turn/steer"].includes(method)) {
       const normalized = desktopOptions(params);
       params = normalized.params;
       validateExecutionOptions(params);
@@ -109,15 +131,33 @@ export class AppServer {
         const auth = control ? await control.identity() : undefined;
         return { authMethod: auth ? "chatgpt" : null, authToken: null, requiresOpenaiAuth: true };
       }
-      case "model/list": return page(await this.options.models(), params);
+      case "model/list": return page(await this.models(client.activeThread), params);
+      case "skills/list": {
+        if (params.forceReload != null && typeof params.forceReload !== "boolean") throw new RpcError(-32602, "forceReload must be a boolean.");
+        const cwds = params.cwds ?? [];
+        if (!Array.isArray(cwds) || cwds.length > 16) throw new RpcError(-32602, "Select up to 16 skill directories.");
+        // Active sessions are authoritative (including temporary and extension-provided skills).
+        // Unopened projects are discovered without starting a Pi worker or granting project trust.
+        const roots = [...new Set(await Promise.all((cwds.length ? cwds : [config.userHome])
+          .map(cwd => files.directory(cwd === "~" ? config.userHome : cwd))))];
+        return { data: await Promise.all(roots.map(async cwd => ({ cwd, errors: [],
+          skills: skillMetadata(await sessions.skills(cwd, client.activeThread) ?? await this.options.skills?.(cwd) ?? []) }))) };
+      }
+      case "fuzzyFileSearch": return client.search.search(params);
+      case "fuzzyFileSearch/sessionStart": return client.search.start(params);
+      case "fuzzyFileSearch/sessionUpdate": return client.search.update(params);
+      case "fuzzyFileSearch/sessionStop": return client.search.stop(params);
       case "account/read": return { account: control?.enrollment ? { type: "chatgpt", email: null, planType: "unknown" } : null,
         requiresOpenaiAuth: true, workspaceRouting: null };
       case "config/read": {
-        const models = await this.options.models();
-        const current = sessions.list({ ...(params.cwd ? { cwd: params.cwd } : {}), sortKey: "updated_at" })[0];
-        return { config: { model: current?.model ?? models[0]?.id ?? null, model_provider: "pi", approval_policy: "never",
-          sandbox_mode: "danger-full-access", cwd: params.cwd ?? config.userHome, user_home: config.userHome,
-          model_reasoning_effort: current?.reasoningEffort ?? "medium", service_tier: null, features: disabledFeatures() },
+        const models = await this.models(client.activeThread);
+        const cwd = params.cwd == null ? undefined : await files.directory(params.cwd === "~" ? config.userHome : params.cwd);
+        const selected = client.activeThread ? sessions.read(client.activeThread, false) : undefined;
+        const current = selected && (!cwd || selected.cwd === cwd) ? selected : sessions.list({ ...(cwd ? { cwd } : {}), sortKey: "updated_at" })[0];
+        const preferred = models.find(model => model.isDefault) ?? models[0];
+        return { config: { model: current?.model ?? preferred?.id ?? null, model_provider: current?.modelProvider ?? "pi", approval_policy: "never",
+          sandbox_mode: "danger-full-access", cwd: cwd ?? config.userHome, user_home: config.userHome,
+          model_reasoning_effort: current?.reasoningEffort ?? preferred?.defaultReasoningEffort ?? "none", service_tier: null, features: disabledFeatures() },
           origins: {}, ...(params.includeLayers ? { layers: [] } : {}) };
       }
       case "configRequirements/read": return { requirements: {
@@ -202,7 +242,7 @@ export class AppServer {
         const project = params.projectId ? this.project(params.projectId) : undefined;
         const cwd = await files.directory(params.cwd ?? project?.roots[0]?.path ?? config.userHome);
         const response = await sessions.start({ ...params, cwd });
-        client.subscriptions.add(response.thread.id);
+        client.subscriptions.add(response.thread.id); client.activeThread = response.thread.id;
         // The creator must receive the start event even before it has a subscription.
         return response;
       }
@@ -217,11 +257,20 @@ export class AppServer {
         client.subscriptions.add(id);
         try {
           const response = await sessions.resume(id);
+          client.activeThread = id;
           if (!response.thread.canAcceptDirectInput) this.warning(client, "terminal-offline", "Reconnect this conversation in Pi to send messages.",
             "The saved history is available. Open this conversation in Pi and run /remote start; no second Pi process was started.");
           return response;
         }
         catch (error) { client.subscriptions.delete(id); throw error; }
+      }
+      case "thread/settings/update": {
+        const id = text(params.threadId, "threadId"); sessions.record(id); client.subscriptions.add(id); client.activeThread = id;
+        return sessions.updateSettings(id, params);
+      }
+      case "thread/goal/get": {
+        sessions.record(text(params.threadId, "threadId"));
+        return { goal: null }; // Pi has no Codex goal; mutation APIs remain unsupported.
       }
       case "thread/read": return { thread: sessions.read(text(params.threadId, "threadId"), params.includeTurns === true) };
       case "thread/turns/list": {
@@ -246,6 +295,7 @@ export class AppServer {
       case "thread/unsubscribe": {
         const id = text(params.threadId, "threadId"); sessions.record(id);
         const subscribed = client.subscriptions.delete(id);
+        if (client.activeThread === id) client.activeThread = undefined;
         return { status: subscribed ? "unsubscribed" : "notSubscribed" };
       }
       case "thread/name/set": sessions.rename(text(params.threadId, "threadId"), params.name); return {};
@@ -255,7 +305,7 @@ export class AppServer {
       }
       case "turn/start":
       case "turn/steer": {
-        const id = text(params.threadId, "threadId"); sessions.record(id); client.subscriptions.add(id);
+        const id = text(params.threadId, "threadId"); sessions.record(id); client.subscriptions.add(id); client.activeThread = id;
         const userId = params.clientUserMessageId == null ? `${client.id}:${requestId}` : text(params.clientUserMessageId, "clientUserMessageId", 512);
         return sessions.input(id, params, `${client.deviceId}:${userId}`, method === "turn/steer");
       }
@@ -272,6 +322,16 @@ export class AppServer {
     }
     state.set("diagnostics", "unsupported", { method, at: now() });
     throw new RpcError(-32601, `This Pi host does not support ${method}.`);
+  }
+  private async models(threadId?: string): Promise<JsonObject[]> {
+    const live = this.options.sessions.modelCatalog(threadId);
+    let base: JsonObject[];
+    try { base = await this.options.models(); }
+    catch (error) { if (!live.length) throw error; base = []; }
+    const catalog = [...new Map([...base, ...live].map(model => [model.id, model])).values()];
+    const current = threadId ? this.options.sessions.read(threadId, false).model : this.options.sessions.list({ sortKey: "updated_at" })[0]?.model;
+    const preferred = catalog.find(model => model.id === current) ?? catalog.find(model => model.isDefault) ?? catalog[0];
+    return catalog.map(model => ({ ...model, isDefault: model === preferred }));
   }
   private warning(client: Client, key: string, summary: string, details: string): void {
     if (client.warnings.has(key)) return;

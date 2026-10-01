@@ -176,9 +176,10 @@ export class Relay {
   private identity?: string;
   private api: ControlApi;
   private changed: () => void;
+  private failed: (error: unknown) => void;
   constructor(api: ControlApi, deliver: (stream: Stream, message: RpcMessage) => Promise<void>, closed: (stream: Stream) => void,
-    changed: () => void = () => {}) {
-    this.api = api; this.changed = changed;
+    changed: () => void = () => {}, failed: (error: unknown) => void = () => {}) {
+    this.api = api; this.changed = changed; this.failed = failed;
     this.wire = new WireState(async (stream, message) => {
       if (!this.revoked.has(stream.clientId)) await deliver(stream, message);
     }, wire => {
@@ -214,6 +215,7 @@ export class Relay {
         await this.connect(connection, signal, () => { attempt = 0; this.setStatus("connected"); });
       } catch (error) {
         if (signal.aborted) break;
+        this.failed(error);
         if (error instanceof RpcError && error.code === -32001) { this.wire.clear(); this.identity = undefined; }
         this.setStatus("errored");
         if (error instanceof BackendError && [401, 403].includes(error.status)) this.api.invalidateToken();
@@ -234,14 +236,14 @@ export class Relay {
       const abort = () => socket.terminate();
       signal.addEventListener("abort", abort, { once: true });
       const heartbeat = setInterval(() => {
-        if (Date.now() - lastPong > 60_000) return socket.terminate();
+        if (Date.now() - lastPong > 60_000) { failure = new Error("Remote heartbeat timed out."); socket.terminate(); return; }
         if (socket.readyState === WebSocket.OPEN) socket.ping();
       }, 10_000);
       let checking = false;
       const authWatch = setInterval(() => {
         if (checking) return;
         checking = true;
-        void this.api.identity().catch(() => { this.wire.clear(); socket.terminate(); }).finally(() => { checking = false; });
+        void this.api.identity().catch(error => { failure = error; this.wire.clear(); socket.terminate(); }).finally(() => { checking = false; });
       }, 30_000);
       socket.on("pong", () => { lastPong = Date.now(); });
       socket.on("open", () => { opened(); this.wire.replay(); });
@@ -249,7 +251,7 @@ export class Relay {
         if (binary) { failure = new Error("Expected a text frame."); socket.terminate(); return; }
         const value = data.toString();
         pendingBytes += Buffer.byteLength(value);
-        if (pendingBytes > MAX_BUFFER) { socket.terminate(); return; }
+        if (pendingBytes > MAX_BUFFER) { failure = new Error("Remote incoming buffer exceeded."); socket.terminate(); return; }
         incoming = incoming.then(() => this.wire.receive(value)).catch(error => { failure = error; socket.terminate(); })
           .finally(() => { pendingBytes -= Buffer.byteLength(value); });
       });

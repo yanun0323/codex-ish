@@ -6,15 +6,17 @@ import { resolve } from "node:path";
 import { config as loadConfig, type RemoteConfig } from "./config.js";
 import { ControlApi, type Credentials } from "./control-api.js";
 import { HostFiles } from "./filesystem.js";
+import { RemoteDiagnostics } from "./diagnostics.js";
 import { Peer, sameSecret, type Endpoint } from "./ipc.js";
 import { Relay } from "./relay.js";
 import { PiRuntime, piInput } from "./runtime.js";
 import { AppServer } from "./server.js";
 import { Sessions, type Backend, type BackendFactory } from "./sessions.js";
+import type { RemoteSkill } from "./skills.js";
 import { State } from "./state.js";
 import { object, RpcError, text, type JsonObject } from "./types.js";
 
-export interface HostRuntime { credentials(): Promise<Credentials>; models(): Promise<JsonObject[]>; createBackend: BackendFactory }
+export interface HostRuntime { credentials(): Promise<Credentials>; models(): Promise<JsonObject[]>; skills?(cwd: string): Promise<RemoteSkill[]>; createBackend: BackendFactory }
 export function processIsRunning(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try { process.kill(pid, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
@@ -24,6 +26,7 @@ export async function startHost(config: RemoteConfig, createRuntime: (files: Hos
   if (process.platform === "win32") throw new Error("This Remote host currently requires macOS or Linux.");
   if (Buffer.byteLength(config.socket) > 100) throw new Error("Remote socket path is too long. Set PI_CODEX_ISH_REMOTE_HOME to a shorter private directory.");
   await mkdir(config.home, { recursive: true, mode: 0o700 }); await chmod(config.home, 0o700);
+  const diagnostics = new RemoteDiagnostics(config);
   const state = new State(config.database);
   const instance = randomUUID();
   try {
@@ -52,17 +55,19 @@ export async function startHost(config: RemoteConfig, createRuntime: (files: Hos
     sharedRoots: [...files.roots], enabled: state.get<boolean>("host", "enabled") ?? false,
     liveSessions: sessions.loaded().filter(id => sessions.record(id).owner === "live").length,
     lastCompatibilityNotice: state.get("diagnostics", "compatibility") ?? null,
-    lastUnsupportedMethod: state.get("diagnostics", "unsupported") ?? null });
+    lastUnsupportedMethod: state.get("diagnostics", "unsupported") ?? null,
+    diagnosticLog: diagnostics.status() });
   const app = new AppServer({ config, files, state, sessions, models: () => runtime.models(), control: api,
-    remoteStatus: status, revoke: id => relay.revoke(id) });
+    skills: cwd => runtime.skills?.(cwd) ?? Promise.resolve([]), remoteStatus: status, revoke: id => relay.revoke(id), diagnostics });
   relay = new Relay(api, async (stream, message) => {
     await api.identity();
     const client = app.connect(stream.key, stream.clientId, value => relay.wire.send(stream, value));
     await app.receive(client, message);
   }, stream => app.disconnect(stream.key), () => {
+    diagnostics.event(`relay/${relay.status}`);
     for (const peer of peers) { try { peer.notify("host/status", status()); } catch { peer.close(); } }
     app.notify(undefined, "remoteControl/status/changed", status());
-  });
+  }, error => diagnostics.failure("relay/error", error));
   let closing: Promise<void> | undefined;
   let requestShutdown: (() => void) | undefined;
   const stopped = new Promise<void>(resolve => { requestShutdown = resolve; });
@@ -124,11 +129,20 @@ export async function startHost(config: RemoteConfig, createRuntime: (files: Hos
           // Only an authenticated LOCAL Pi process may add a root outside the home directory.
           await files.addRoot(info.cwd);
           state.set("host", "sharedRoots", [...files.roots]);
+          const cwd = await files.directory(info.cwd);
+          const skills = async (): Promise<RemoteSkill[]> => (await peer.call("bridge/skills", { threadId: info.id })).skills;
+          const prepareInput = (input: JsonObject[]) => piInput(input, files, { cwd, skills });
           const backend: Backend = {
-            info: { id: info.id, cwd: info.cwd, model: info.model, provider: info.provider, effort: info.effort,
-              busy: info.busy === true, name: info.name, sessionFile: info.sessionFile },
-            send: async (input, options) => {
-              const parsed = await piInput(input, files);
+            info: { id: info.id, cwd, model: info.model, provider: info.provider, effort: info.effort,
+              busy: info.busy === true, name: info.name, sessionFile: info.sessionFile, models: info.models },
+            skills, prepareInput,
+            configure: async options => {
+              const result = await peer.call("bridge/settings", { threadId: info.id, ...options });
+              sessions.settingsChanged(info.id, object(result.info) as any);
+              if (Array.isArray(result.info.models)) backend.info.models = result.info.models;
+            },
+            send: async (input, options, prepared) => {
+              const parsed = prepared ?? await prepareInput(input);
               const result = await peer.call("bridge/input", { threadId: info.id, text: parsed.text, images: parsed.images, ...options });
               if (result.info) {
                 backend.info.model = text(result.info.model, "model");
@@ -150,6 +164,7 @@ export async function startHost(config: RemoteConfig, createRuntime: (files: Hos
     if (closing) return closing;
     closing = (async () => {
       await relay.stop();
+      for (const id of [...app.clients.keys()]) app.disconnect(id);
       for (const peer of peers) peer.close();
       await sessions.close();
       await new Promise<void>(resolve => server.close(() => resolve()));
@@ -157,7 +172,7 @@ export async function startHost(config: RemoteConfig, createRuntime: (files: Hos
         const saved = JSON.parse(await readFile(config.endpoint, "utf8"));
         if (saved.instance === instance) { await rm(config.endpoint, { force: true }); await rm(config.socket, { force: true }); }
       } catch { /* No endpoint was published, or it was already removed. */ }
-      release(); state.close(); requestShutdown?.();
+      release(); state.close(); diagnostics.event("host/stopped"); requestShutdown?.();
     })();
     return closing;
   }
@@ -166,10 +181,11 @@ export async function startHost(config: RemoteConfig, createRuntime: (files: Hos
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject); server.listen(config.socket, () => { server.off("error", reject); resolve(); });
     });
-    server.on("error", () => { void close(); });
+    server.on("error", error => { diagnostics.failure("host/socket_error", error); void close(); });
     await chmod(config.socket, 0o600);
     const temporary = `${config.endpoint}.${instance}.tmp`;
     await writeFile(temporary, JSON.stringify(endpoint), { mode: 0o600 }); await rename(temporary, config.endpoint);
+    diagnostics.event("host/started");
     if (state.get<boolean>("host", "enabled")) relay.start();
   } catch (error) { await close(); throw error; }
   return { close, stopped, status, app, relay, sessions, files, state };
@@ -187,5 +203,8 @@ async function main() {
   process.exit(0);
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  main().catch(() => { console.error("Remote host could not start. Check the Pi version, build, and private Remote directory."); process.exit(1); });
+  main().catch(error => {
+    try { new RemoteDiagnostics(loadConfig()).failure("host/startup_error", error); } catch { /* Invalid configuration. */ }
+    console.error("Remote host could not start. Check the private Remote diagnostic log, Pi version, and build."); process.exit(1);
+  });
 }

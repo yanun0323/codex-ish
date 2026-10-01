@@ -1,15 +1,20 @@
 import { createHash, randomUUID } from "node:crypto";
 import { State } from "./state.js";
 import { APP_SERVER_VERSION } from "./version.js";
-import { now, RpcError, text, type JsonObject } from "./types.js";
+import { now, RpcError, text, type JsonObject, type PreparedInput } from "./types.js";
+import type { ModelOptions } from "./models.js";
+import type { RemoteSkill } from "./skills.js";
 
 export interface BackendInfo {
   id: string; cwd: string; model: string; provider: string; effort: string;
-  sessionFile?: string; name?: string; busy?: boolean;
+  sessionFile?: string; name?: string; busy?: boolean; models?: JsonObject[];
 }
 export interface Backend {
   info: BackendInfo;
-  send(input: JsonObject[], options: { steer: boolean; model?: string; effort?: string }): Promise<void>;
+  configure?(options: ModelOptions): Promise<void>;
+  skills?(): Promise<RemoteSkill[]>;
+  prepareInput?(input: JsonObject[]): Promise<PreparedInput>;
+  send(input: JsonObject[], options: { steer: boolean; model?: string; effort?: string }, prepared?: PreparedInput): Promise<void>;
   abort(): Promise<void>;
   close(): Promise<void>;
 }
@@ -33,6 +38,17 @@ const messageKey = (message: JsonObject) => createHash("sha256").update(JSON.str
     .map((part: JsonObject) => part.type === "text" ? { type: "text", text: part.text } : { type: "thinking", thinking: part.thinking ?? "" }) })).digest("hex");
 const boundedText = (value: string, limit = 256 * 1024) => value.length > limit ? value.slice(0, limit) + "\n[Remote display truncated]" : value;
 
+function displayInput(input: JsonObject[]): JsonObject[] {
+  return input.map(value => {
+    const part = copy(value);
+    if (part.type !== "text") return part;
+    // Desktop calls text_elements.some() without a guard. Older hosts used the wrong casing.
+    part.text_elements = Array.isArray(part.text_elements) ? part.text_elements : Array.isArray(part.textElements) ? part.textElements : [];
+    delete part.textElements;
+    return part;
+  });
+}
+
 export function makeThread(info: BackendInfo): JsonObject {
   return { id: info.id, sessionId: info.id, forkedFromId: null, parentThreadId: null, preview: "", ephemeral: false,
     section: null, sectionEnteredAt: null, projectId: null, historyMode: "legacy", modelProvider: info.provider,
@@ -42,11 +58,18 @@ export function makeThread(info: BackendInfo): JsonObject {
     agentNickname: null, agentRole: null, gitInfo: null, name: info.name ?? null, daybreakEnabled: null,
     environments: null, extra: null, turns: [] };
 }
+export function threadSettings(thread: JsonObject): JsonObject {
+  return { disabledPluginIds: [], cwd: thread.cwd, model: thread.model, modelProvider: thread.modelProvider,
+    effort: thread.reasoningEffort, serviceTier: null, summary: null, personality: null,
+    approvalPolicy: "never", approvalsReviewer: "user", sandboxPolicy: { type: "dangerFullAccess" }, activePermissionProfile: null,
+    collaborationMode: { mode: "default", settings: { model: thread.model, reasoning_effort: thread.reasoningEffort, developer_instructions: null } },
+    multiAgentMode: "explicitRequestOnly" };
+}
 export function sessionResponse(thread: JsonObject): JsonObject {
   return { thread, model: thread.model, modelProvider: thread.modelProvider, serviceTier: null, cwd: thread.cwd,
     runtimeWorkspaceRoots: [thread.cwd], instructionSources: [], approvalPolicy: "never", approvalsReviewer: "user",
     sandbox: { type: "dangerFullAccess" }, activePermissionProfile: null, reasoningEffort: thread.reasoningEffort,
-    collaborationMode: null, multiAgentMode: "explicitRequestOnly", disabledPluginIds: [],
+    collaborationMode: threadSettings(thread).collaborationMode, multiAgentMode: "explicitRequestOnly", disabledPluginIds: [],
     initialTurnsPage: null, turnsBackwardsCursor: null, itemsBackwardsCursor: null };
 }
 export function validateExecutionOptions(params: JsonObject): void {
@@ -62,7 +85,8 @@ export function validateExecutionOptions(params: JsonObject): void {
   for (const key of ["outputSchema", "toolOutput", "collaborationMode", "environments", "additionalContext", "developerInstructions", "baseInstructions", "dynamicTools", "serviceTier", "serviceTierForTurn", "cyberAccessProgram", "permissionProfile", "additionalPermissions", "runtimeWorkspaceRoots"]) {
     if (params[key] != null) throw new RpcError(-32602, `${key} is not supported by this Pi host.`);
   }
-  if (params.effort != null && !["none", "minimal", "low", "medium", "high", "xhigh"].includes(params.effort)) {
+  if (params.model != null) text(params.model, "model", 512);
+  if (params.effort != null && !["none", "minimal", "low", "medium", "high", "xhigh", "max"].includes(params.effort)) {
     throw new RpcError(-32602, "This reasoning effort is not supported by Pi.");
   }
 }
@@ -86,6 +110,9 @@ export class Sessions {
       record.thread.status = { type: "notLoaded" };
       record.thread.canAcceptDirectInput = record.owner === "daemon";
       for (const turn of record.thread.turns) {
+        for (const item of turn.items) {
+          if (item.type === "userMessage") item.content = displayInput(item.content);
+        }
         if (turn.status === "inProgress") {
           turn.status = "interrupted"; turn.completedAt = now();
           turn.error = { message: "The host restarted. This request was not automatically repeated.", codexErrorInfo: null, additionalDetails: null };
@@ -135,6 +162,43 @@ export class Sessions {
       .sort((a, b) => ((value(b) - value(a)) || b.id.localeCompare(a.id)) * (params.sortDirection === "asc" ? -1 : 1));
   }
   loaded(): string[] { return [...this.backends.keys()]; }
+  modelCatalog(preferred?: string): JsonObject[] {
+    const catalog = [...this.backends.values()].flatMap(backend => backend.info.models ?? []);
+    return [...catalog, ...(preferred ? this.backends.get(preferred)?.info.models ?? [] : [])];
+  }
+  async skills(cwd: string, preferred?: string): Promise<RemoteSkill[] | undefined> {
+    const selected = preferred ? this.backends.get(preferred) : undefined;
+    const backend = selected?.info.cwd === cwd && selected.skills ? selected
+      : [...this.backends.values()].reverse().find(backend => backend.info.cwd === cwd && backend.skills);
+    return backend?.skills?.();
+  }
+  settingsChanged(id: string, info: Pick<BackendInfo, "model" | "provider" | "effort">): void {
+    text(info.model, "model", 512); text(info.provider, "provider", 256);
+    validateExecutionOptions({ effort: info.effort });
+    const thread = this.record(id).thread;
+    const changed = thread.model !== info.model || thread.modelProvider !== info.provider || thread.reasoningEffort !== info.effort;
+    const backend = this.backends.get(id);
+    if (backend) Object.assign(backend.info, { model: info.model, provider: info.provider, effort: info.effort });
+    if (!changed) return;
+    thread.model = info.model; thread.modelProvider = info.provider; thread.reasoningEffort = info.effort;
+    this.persist(id);
+    this.emit(id, "thread/settings/updated", { threadId: id, threadSettings: threadSettings(thread) });
+  }
+  async updateSettings(id: string, params: JsonObject): Promise<JsonObject> {
+    return this.serial(id, async () => {
+      validateExecutionOptions(params);
+      const allowed = new Set(["threadId", "model", "effort", "cwd", "approvalPolicy", "approvalsReviewer", "sandboxPolicy", "disabledPluginIds", "serviceTier"]);
+      if (Object.keys(params).some(key => !allowed.has(key) && params[key] != null)) throw new RpcError(-32602, "Change only the model or thinking level here. Configure other settings in Pi.");
+      const thread = this.record(id).thread;
+      if (params.cwd != null && params.cwd !== thread.cwd) throw new RpcError(-32602, "Start a new conversation to change its project directory.");
+      if (this.active.has(id)) throw new RpcError(-32602, "Wait for this turn to finish before changing the model or thinking level.");
+      const backend = await this.backend(id);
+      if (!backend.configure) throw new RpcError(-32600, "Reload codex-ish in Pi to change this conversation's model or thinking level.");
+      await backend.configure({ model: params.model ?? undefined, effort: params.effort ?? undefined });
+      this.settingsChanged(id, backend.info);
+      return {};
+    });
+  }
   private serial<T>(id: string, run: () => Promise<T>): Promise<T> {
     const previous = this.locks.get(id) ?? Promise.resolve();
     const current = previous.catch(() => {}).then(run);
@@ -171,7 +235,8 @@ export class Sessions {
     let pending = this.loading.get(id);
     if (!pending) {
       pending = this.createBackend(record, {}, event => this.event(id, event)).then(backend => {
-        this.backends.set(id, backend); record.thread.status = { type: "idle" }; return backend;
+        this.backends.set(id, backend); record.thread.status = { type: "idle" };
+        this.settingsChanged(id, backend.info); return backend;
       }).finally(() => this.loading.delete(id));
       this.loading.set(id, pending);
     }
@@ -237,8 +302,9 @@ export class Sessions {
         if (!turn) throw new RpcError(-32600, "The previous request is no longer available. Read the conversation before resending.");
         return steer ? { turnId: turn.id } : { turn: copy(turn) };
       }
-      await this.validateInput(params.input);
       const backend = await this.backend(id);
+      const prepared = backend.prepareInput ? await backend.prepareInput(params.input) : undefined;
+      if (!prepared) await this.validateInput(params.input);
       const current = this.active.get(id);
       if (steer && (!current || params.expectedTurnId !== current.turn.id)) throw new RpcError(-32602, "The active turn changed. Resume the conversation and try again.");
       const thread = this.record(id).thread;
@@ -247,8 +313,8 @@ export class Sessions {
         throw new RpcError(-32602, "Wait for this turn to finish before changing the model or reasoning effort.");
       }
       const active = this.ensureActive(id);
-      const item = { type: "userMessage", id: randomUUID(), clientId: params.clientUserMessageId ?? null, content: copy(params.input) };
-      active.pendingUsers.push(inputText(params.input));
+      const item = { type: "userMessage", id: randomUUID(), clientId: params.clientUserMessageId ?? null, content: displayInput(params.input) };
+      active.pendingUsers.push(prepared?.text ?? inputText(params.input));
       this.item(id, item, true);
       this.state.transaction(() => {
         this.persist(id);
@@ -256,8 +322,8 @@ export class Sessions {
       });
       try {
         // send() acknowledges acceptance, not completion. Pi owns the follow-up queue.
-        await backend.send(params.input, { steer, model: params.model, effort: params.effort });
-        thread.model = backend.info.model; thread.modelProvider = backend.info.provider; thread.reasoningEffort = backend.info.effort;
+        await backend.send(params.input, { steer, model: params.model, effort: params.effort }, prepared);
+        this.settingsChanged(id, backend.info);
         thread.path = backend.info.sessionFile ?? thread.path;
         this.record(id).sessionFile = backend.info.sessionFile;
       } catch (error) {
@@ -314,6 +380,12 @@ export class Sessions {
         event.type === "message_end" && event.message?.role === "assistant")) {
       (record.liveMessages ??= []).push(messageKey(event.message));
     }
+    if (event.type === "remote_settings_changed") {
+      this.settingsChanged(id, event.info);
+      const backend = this.backends.get(id);
+      if (backend && Array.isArray(event.info.models)) backend.info.models = event.info.models;
+      return;
+    }
     if (event.type === "agent_start") { this.ensureActive(id); return; }
     if (event.type === "message_start") {
       if (event.message?.role === "assistant") {
@@ -324,7 +396,7 @@ export class Sessions {
         const pending = active.pendingUsers.indexOf(value);
         if (pending >= 0) active.pendingUsers.splice(pending, 1);
         else this.item(id, { type: "userMessage", id: randomUUID(), clientId: null,
-          content: [{ type: "text", text: boundedText(value), textElements: [] }] }, true);
+          content: [{ type: "text", text: boundedText(value), text_elements: [] }] }, true);
       }
       return;
     }

@@ -6,6 +6,7 @@ import { HostFiles } from "../dist/remote/filesystem.js";
 import { Sessions } from "../dist/remote/sessions.js";
 import { AppServer } from "../dist/remote/server.js";
 import { piInput } from "../dist/remote/runtime.js";
+import { RpcError } from "../dist/remote/types.js";
 
 export async function fixture(t) {
   const root = await mkdtemp("/tmp/cish-");
@@ -39,6 +40,11 @@ export function mockRuntime() {
         model: "fake/test", provider: "fake", effort: "medium" };
       const backend = {
         info, sends: [], closed: false, aborts: 0,
+        configure: async options => {
+          if (options.model != null && !["fake/test", "fake/other"].includes(options.model)) throw new RpcError(-32602, "Model not found.");
+          if (options.model != null) info.model = options.model;
+          if (options.effort != null) info.effort = options.effort;
+        },
         send: async (input, options) => {
           backend.sends.push({ input, options });
           emit({ type: "agent_start" });
@@ -73,7 +79,7 @@ export async function client(app, name, deviceId = name) {
   return { messages, connection, send, events: method => messages.filter(message => message.method === method),
     close: () => app.disconnect(name) };
 }
-export const input = text => [{ type: "text", text, textElements: [] }];
+export const input = text => [{ type: "text", text, text_elements: [] }];
 export async function eventually(check, timeout = 3000) {
   const end = Date.now() + timeout;
   while (Date.now() < end) { const value = await check(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 10)); }

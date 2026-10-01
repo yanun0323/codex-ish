@@ -2,6 +2,7 @@ export type JsonObject = Record<string, any>;
 export type RpcId = string | number;
 export type RpcMessage = { id?: RpcId; method?: string; params?: JsonObject; result?: unknown; error?: { code: number; message: string; data?: unknown } };
 export type Notify = (method: string, params: JsonObject) => void;
+export interface PreparedInput { text: string; images: { type: "image"; data: string; mimeType: string }[]; }
 
 export class RpcError extends Error {
   readonly code: number;
