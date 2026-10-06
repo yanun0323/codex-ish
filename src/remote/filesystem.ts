@@ -3,6 +3,7 @@ import { lstat, mkdir, open, opendir, readdir, realpath, stat } from "node:fs/pr
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { RpcError, text } from "./types.js";
+import { Attachments } from "./attachments.js";
 
 const deniedNames = /^(?:\.env(?:\..*)?|auth\.json|credentials(?:\.json)?|id_(?:rsa|ed25519|ecdsa)(?:\.pub)?|.*\.(?:pem|key|p12|pfx))$/i;
 const inside = (root: string, path: string) => path === root || path.startsWith(root + sep);
@@ -13,8 +14,11 @@ export class HostFiles {
   private denied: string[] = [];
   private ready: Promise<void>;
   readonly home: string;
+  private attachments: Attachments;
+  get codexHome(): string { return this.attachments.home; }
   constructor(home: string, agentDir: string, remoteHome: string) {
     this.home = home;
+    this.attachments = new Attachments(home, remoteHome);
     this.denied = [agentDir, remoteHome, ...[".ssh", ".aws", ".gnupg", ".kube", ".pi", ".codex", ".config/gcloud", "Library/Keychains"]
       .map(path => join(home, path))].map(path => resolve(path));
     this.ready = (async () => {
@@ -42,12 +46,15 @@ export class HostFiles {
     if (path.startsWith("file:")) {
       try { path = fileURLToPath(path); } catch { throw new RpcError(-32602, "Use a local file path."); }
     }
+    if (path === "~") path = this.home;
+    else if (path.startsWith("~/")) path = join(this.home, path.slice(2));
     if (!isAbsolute(path)) throw new RpcError(-32602, "Use an absolute path.");
     return resolve(path);
   }
   async existing(value: unknown): Promise<string> {
     await this.ready;
     const path = this.input(value);
+    if (this.attachments.matches(path)) return this.attachments.existing(path);
     if (!this.allowed(path)) throw new RpcError(-32600, "This path is not shared with Remote.");
     let canonical: string;
     try { canonical = await realpath(path); } catch { throw new RpcError(-32602, "Path not found."); }
@@ -66,7 +73,7 @@ export class HostFiles {
     if (names.length > 20_000) throw new RpcError(-32600, "This directory has too many entries. Choose a subdirectory.");
     for (const name of names.sort()) {
       try {
-        const child = await this.existing(join(path, name));
+        const child = await this.existing(join(this.input(value), name));
         const info = await stat(child);
         entries.push({ fileName: name, isDirectory: info.isDirectory(), isFile: info.isFile() });
       } catch { /* Protected, dangling, or inaccessible children are not exposed. */ }
@@ -106,12 +113,13 @@ export class HostFiles {
     const input = this.input(value);
     const path = await this.existing(value);
     const info = await stat(path);
-    return { isDirectory: info.isDirectory(), isFile: info.isFile(), isSymlink: (await lstat(input)).isSymbolicLink(),
+    return { isDirectory: info.isDirectory(), isFile: info.isFile(), isSymlink: this.attachments.matches(input) ? false : (await lstat(input)).isSymbolicLink(),
       createdAtMs: Math.trunc(info.birthtimeMs), modifiedAtMs: Math.trunc(info.mtimeMs) };
   }
   async create(value: unknown, recursive = true): Promise<string> {
     await this.ready;
     const target = this.input(value);
+    if (this.attachments.matches(target)) return this.attachments.create(target);
     if (!this.allowed(target)) throw new RpcError(-32600, "This directory is not shared with Remote.");
     let ancestor = target;
     const missing: string[] = [];
@@ -135,6 +143,14 @@ export class HostFiles {
       current = await this.directory(next);
     }
     return current;
+  }
+  async writeAttachment(value: unknown, dataBase64: unknown): Promise<void> {
+    await this.ready;
+    await this.attachments.write(this.input(value), dataBase64);
+  }
+  async removeAttachment(value: unknown, recursive: boolean, force: boolean): Promise<void> {
+    await this.ready;
+    await this.attachments.remove(this.input(value), recursive, force);
   }
   async read(value: unknown, max = 8 * 1024 * 1024): Promise<Buffer> {
     const path = await this.existing(value);

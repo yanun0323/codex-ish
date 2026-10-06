@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { appendFileSync, chmodSync, closeSync, constants, fchmodSync, fstatSync, mkdirSync, openSync, renameSync } from "node:fs";
 import { join, relative, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { RemoteConfig } from "./config.js";
 import { RpcError, type JsonObject, type RpcMessage } from "./types.js";
 
@@ -19,7 +20,8 @@ const keys = new Set(("threadId turnId expectedTurnId clientUserMessageId client
   "authToken accessToken token authorization headers url images image imageUrl fileId detail delta result params method " +
   "outputSchema metadata roots title disabledPluginIds additionalContext additionalPermissions permissionProfile " +
   "threadSettings supportedReasoningEfforts defaultReasoningEffort isDefault displayName model_provider model_reasoning_effort " +
-  "query sessionId forceReload skills enabled scope match_type file_name files score indices cancellationToken").split(" "));
+  "query sessionId forceReload skills enabled scope match_type file_name fileName files score indices cancellationToken " +
+  "codexHome user_home platformFamily platformOs marketplaces marketplaceLoadErrors recursive force").split(" "));
 const types = new Set(["text", "image", "localImage", "audio", "localAudio", "skill", "mention", "userMessage", "agentMessage", "reasoning",
   "commandExecution", "dynamicToolCall", "fileChange", "mcpToolCall", "idle", "active", "notLoaded", "dangerFullAccess", "readOnly"]);
 const hash = (value: string) => createHash("sha256").update(value).digest("hex").slice(0, 16);
@@ -96,10 +98,14 @@ export class RemoteDiagnostics {
     const path = typeof params?.path === "string" ? params.path : undefined;
     let pathInfo: JsonObject | undefined;
     if (path) {
+      let localPath = path;
+      const format = path.startsWith("file:") ? "fileUrl" : path === "~" || path.startsWith("~/") ? "homeRelative" : "path";
+      if (format === "fileUrl") { try { localPath = fileURLToPath(path); } catch { localPath = ""; } }
+      if (format === "homeRelative") localPath = join(this.config.userHome, path.slice(2));
       const roots: [string, string][] = [["remote", this.config.home], ["agent", this.config.agentDir], ["codex", join(this.config.userHome, ".codex")],
         ["ssh", join(this.config.userHome, ".ssh")], ["home", this.config.userHome]];
-      const location = roots.find(([, root]) => { const child = relative(root, path); return !child || child !== ".." && !child.startsWith(".." + sep) && !child.startsWith(sep); })?.[0] ?? "other";
-      pathInfo = { location, hash: hash(path) };
+      const location = roots.find(([, root]) => { const child = relative(root, localPath); return !child || child !== ".." && !child.startsWith(".." + sep) && !child.startsWith(sep); })?.[0] ?? "other";
+      pathInfo = { location, format, attachment: localPath.split(sep).some(part => part === "attachments" || part === "uploads"), hash: hash(path) };
     }
     return { method: methodName(message.method), requestId: identifier(message.id), client: `hash:${hash(clientId)}`,
       ...(params?.threadId != null ? { threadId: identifier(params.threadId) } : {}), ...(pathInfo ? { path: pathInfo } : {}) };

@@ -4,6 +4,7 @@ import { pathToFileURL } from "node:url";
 import type { RemoteConfig } from "./config.js";
 import type { Credentials } from "./control-api.js";
 import { HostFiles } from "./filesystem.js";
+import { imageMime } from "./attachments.js";
 import { deferred, object, RpcError, text, type JsonObject, type PreparedInput } from "./types.js";
 import type { Backend, BackendFactory } from "./sessions.js";
 import { SessionOwners, sessionHeader, type SessionOwner } from "./ownership.js";
@@ -31,10 +32,7 @@ export async function piInput(input: JsonObject[], files: HostFiles,
       images.push({ type: "image", data: match[2], mimeType: match[1]! });
     } else if (item.type === "localImage") {
       const bytes = await files.read(item.path);
-      const mime = bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])) ? "image/png"
-        : bytes[0] === 0xff && bytes[1] === 0xd8 ? "image/jpeg"
-        : bytes.toString("ascii", 0, 4) === "RIFF" && bytes.toString("ascii", 8, 12) === "WEBP" ? "image/webp"
-        : bytes.toString("ascii", 0, 3) === "GIF" ? "image/gif" : undefined;
+      const mime = imageMime(bytes);
       if (!mime) throw new RpcError(-32602, "Unsupported image format.");
       images.push({ type: "image", data: bytes.toString("base64"), mimeType: mime });
     } else if (item.type === "skill" && options.skills) {

@@ -3,6 +3,7 @@ import { test } from "node:test";
 import { randomUUID } from "node:crypto";
 import { readFile, stat, readdir, mkdir, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { RemoteDiagnostics, diagnosticError, diagnosticShape } from "../dist/remote/diagnostics.js";
 import { RpcError } from "../dist/remote/types.js";
 import { Relay } from "../dist/remote/relay.js";
@@ -37,6 +38,24 @@ test("request logs correlate failures, successes, replays, and wire shapes witho
   assert.ok(entries.some(e => e.event === "request/error" && e.error.code === "ECONNRESET"));
   assert.equal((await stat(app.diagnostics.path)).mode & 0o777, 0o600);
   assert.equal((await stat(config.home)).mode & 0o777, 0o700);
+});
+
+test("attachment diagnostics classify file URLs and tilde paths without recording image bytes or names", async t => {
+  const { app, config } = await fixture(t); const c = await client(app, "ios");
+  const folder = join(c.messages[0].result.codexHome, "attachments", randomUUID());
+  const path = pathToFileURL(join(folder, "PRIVATE_SCREENSHOT.png")).href;
+  const bytes = Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), Buffer.from("PRIVATE_IMAGE_CONTENT")]).toString("base64");
+  await c.send("fs/createDirectory", { path: pathToFileURL(folder).href, recursive: true });
+  await c.send("fs/writeFile", { path, dataBase64: bytes });
+  await c.send("fs/readFile", { path });
+  await c.send("fs/readDirectory", { path: "~" });
+  const raw = await readFile(app.diagnostics.path, "utf8");
+  for (const secret of [bytes, folder, config.userHome, "PRIVATE_SCREENSHOT", "PRIVATE_IMAGE_CONTENT"]) assert.ok(!raw.includes(secret), secret);
+  const entries = await records(app.diagnostics.path);
+  const upload = entries.find(e => e.event === "request" && e.method === "fs/writeFile");
+  assert.equal(upload.path.format, "fileUrl"); assert.equal(upload.path.location, "codex"); assert.equal(upload.path.attachment, true);
+  assert.equal(entries.find(e => e.event === "request" && e.method === "fs/readDirectory").path.location, "home");
+  assert.ok(entries.some(e => e.event === "response" && e.method === "fs/writeFile" && e.outcome === "ok"));
 });
 
 test("invalid requests, collisions, and response delivery failures are logged without changing protocol behavior", async t => {

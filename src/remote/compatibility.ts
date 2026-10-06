@@ -40,6 +40,14 @@ function desktopConfig(value: unknown): void {
 export function desktopOptions(raw: JsonObject): { params: JsonObject; notice: boolean } {
   const params = { ...raw };
   let notice = false;
+  // iOS echoes the mode already reported in thread settings. Accept that
+  // default without changing Pi's tools or enabling automatic delegation.
+  if (Object.hasOwn(params, "multiAgentMode")) {
+    if (params.multiAgentMode != null && params.multiAgentMode !== "explicitRequestOnly") {
+      throw new RpcError(-32602, "Use explicit agent requests. Automatic delegation cannot be configured through Remote.");
+    }
+    delete params.multiAgentMode;
+  }
   if (params.config != null) {
     const settings = { ...object(params.config) };
     // iOS echoes the thinking selection here when resuming an existing conversation.

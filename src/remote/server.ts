@@ -4,6 +4,7 @@ import type { RemoteConfig } from "./config.js";
 import type { ControlApi } from "./control-api.js";
 import { HostFiles } from "./filesystem.js";
 import { FileSearch } from "./search.js";
+import { DirectoryDiscovery } from "./discovery.js";
 import { skillMetadata, type RemoteSkill } from "./skills.js";
 import { RemoteDiagnostics } from "./diagnostics.js";
 import { Sessions, validateExecutionOptions } from "./sessions.js";
@@ -17,6 +18,7 @@ export interface Client {
   subscriptions: Set<string>; optOut: Set<string>; warnings: Set<string>; send: (message: RpcMessage) => void;
   requests: Map<string, { signature: string; promise: Promise<RpcMessage>; size: number }>;
   search: FileSearch;
+  discovery: DirectoryDiscovery;
   activeThread?: string;
 }
 interface ServerOptions {
@@ -48,10 +50,18 @@ export class AppServer {
         if (this.clients.get(id) === client && client!.ready && !client!.optOut.has(method)) {
           try { client!.send({ method, params }); } catch { this.disconnect(id); }
         }
+      }),
+      discovery: new DirectoryDiscovery(this.options.files, params => {
+        const method = "command/exec/outputDelta";
+        if (this.clients.get(id) === client && client!.ready && !client!.optOut.has(method)) {
+          try { client!.send({ method, params }); } catch { this.disconnect(id); }
+        }
       }) };
     this.clients.set(id, client); return client;
   }
-  disconnect(id: string): void { this.clients.get(id)?.search.close(); this.clients.delete(id); }
+  disconnect(id: string): void {
+    this.clients.get(id)?.search.close(); this.clients.get(id)?.discovery.close(); this.clients.delete(id);
+  }
   notify(threadId: string | undefined, method: string, params: JsonObject): void {
     for (const client of [...this.clients.values()]) {
       if (!client.ready || client.optOut.has(method) || threadId && !client.subscriptions.has(threadId)) continue;
@@ -111,7 +121,9 @@ export class AppServer {
       const optOut = capabilities.optOutNotificationMethods ?? [];
       if (!Array.isArray(optOut) || optOut.length > 256 || optOut.some(value => typeof value !== "string")) throw new RpcError(-32602, "Invalid notification preferences.");
       client.optOut = new Set(optOut); client.experimental = capabilities.experimentalApi === true; client.initialized = true;
-      return { userAgent: APP_SERVER_USER_AGENT, codexHome: config.home,
+      // Apps derive the host's home from the parent of codexHome. Expose only
+      // a virtual App home, never the private service/credential directory.
+      return { userAgent: APP_SERVER_USER_AGENT, codexHome: files.codexHome,
         platformFamily: process.platform === "win32" ? "windows" : "unix", platformOs: process.platform === "darwin" ? "macos" : process.platform };
     }
     if (!client.initialized) throw new RpcError(-32600, "Send initialize before making requests.");
@@ -143,6 +155,14 @@ export class AppServer {
         return { data: await Promise.all(roots.map(async cwd => ({ cwd, errors: [],
           skills: skillMetadata(await sessions.skills(cwd, client.activeThread) ?? await this.options.skills?.(cwd) ?? []) }))) };
       }
+      case "plugin/installed": {
+        const cwds = params.cwds ?? [];
+        if (!Array.isArray(cwds) || cwds.length > 16) throw new RpcError(-32602, "Select up to 16 plugin directories.");
+        await Promise.all(cwds.map(cwd => files.directory(cwd)));
+        // Pi extensions are not Codex plugins; an empty catalog is not an RPC failure.
+        return { marketplaces: [], marketplaceLoadErrors: [] };
+      }
+      case "threadSection/list": return page([], params);
       case "fuzzyFileSearch": return client.search.search(params);
       case "fuzzyFileSearch/sessionStart": return client.search.start(params);
       case "fuzzyFileSearch/sessionUpdate": return client.search.update(params);
@@ -186,7 +206,17 @@ export class AppServer {
         await files.create(params.path, params.recursive ?? true); return {};
       }
       case "fs/readFile": return { dataBase64: (await files.read(params.path)).toString("base64") };
+      case "fs/writeFile": await files.writeAttachment(params.path, params.dataBase64); return {};
+      case "fs/remove": {
+        for (const key of ["recursive", "force"]) {
+          if (params[key] != null && typeof params[key] !== "boolean") throw new RpcError(-32602, `Invalid ${key} option.`);
+        }
+        await files.removeAttachment(params.path, params.recursive ?? true, params.force ?? true); return {};
+      }
       case "command/exec": {
+        // Known iOS probes use native, guarded reads, not Pi or shell execution.
+        const discovery = await client.discovery.run(params);
+        if (discovery) return discovery;
         // Directory discovery only. Do not silently execute arbitrary desktop shell scripts.
         validateExecutionOptions(params);
         if (params.tty || params.streamStdin || params.streamStdoutStderr || params.env || params.permissionProfile) throw new RpcError(-32602, "Use the filesystem APIs for directory discovery.");
