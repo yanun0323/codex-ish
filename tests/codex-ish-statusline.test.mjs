@@ -932,6 +932,52 @@ test("Claude Bridge uses the installed SDK and configured executable without pro
   await f.switch("unsupported"); assert.equal(closes, 2);
 });
 
+for (const trafficBlock of ["1", undefined]) {
+  test(`Claude quota helper allows usage with traffic block ${trafficBlock ?? "unset"} without changing the host environment`, async t => {
+    const inherited = {
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: trafficBlock,
+      DISABLE_TELEMETRY: "",
+      DISABLE_ERROR_REPORTING: "",
+      DISABLE_AUTOUPDATER: "0",
+      DISABLE_FEEDBACK_COMMAND: "0",
+      ENABLE_CLAUDEAI_MCP_SERVERS: "1",
+      CLAUDE_CODE_OAUTH_TOKEN: "fake-claude-token",
+    };
+    const previous = Object.fromEntries(Object.keys(inherited).map(key => [key, process.env[key]]));
+    const restore = values => {
+      for (const [key, value] of Object.entries(values)) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+    };
+    t.after(() => restore(previous));
+    restore(inherited);
+    let options;
+    sdkFixture.query = params => {
+      options = params.options;
+      return {
+        [CLAUDE_USAGE_METHOD]: async () => options.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+          ? { rate_limits_available: true, rate_limits: null }
+          : claudePayload(),
+        close() {},
+      };
+    };
+    const f = await fixture(t, "claude-bridge");
+    await eventually(() => options !== undefined);
+    assert.notEqual(options.env, process.env);
+    // "0" and "false" still block usage: Claude Code checks for a non-empty value.
+    assert.ok(!options.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC);
+    for (const key of ["DISABLE_TELEMETRY", "DISABLE_ERROR_REPORTING", "DISABLE_AUTOUPDATER", "DISABLE_FEEDBACK_COMMAND"]) {
+      assert.equal(options.env[key], "1", `${key} must remain disabled in the helper`);
+    }
+    assert.equal(options.env.ENABLE_CLAUDEAI_MCP_SERVERS, "0");
+    for (const key of ["CLAUDE_CODE_OAUTH_TOKEN", "PATH", "HOME"]) assert.equal(options.env[key], process.env[key]);
+    await eventually(() => f.render().includes("5h 75% left 2h"));
+    assert.match(f.render(), /weekly 40% left 3d/);
+    await f.emit("session_shutdown");
+    assert.deepEqual(Object.fromEntries(Object.keys(inherited).map(key => [key, process.env[key]])), inherited);
+  });
+}
+
 test("Claude Bridge API-key sessions or changed response shapes show unavailable and close the process", async t => {
   let closes = 0;
   sdkFixture.query = () => ({ [CLAUDE_USAGE_METHOD]: async () => ({ rate_limits_available: false, rate_limits: null }), close: () => { closes++; } });

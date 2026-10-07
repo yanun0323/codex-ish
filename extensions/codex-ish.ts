@@ -933,7 +933,17 @@ async function startClaudeUsageQuery(
       cwd, abortController: controller, tools: [], mcpServers: {}, strictMcpConfig: true,
       settingSources: [], persistSession: false, permissionMode: "dontAsk",
       settings: { disableAllHooks: true, autoMemoryEnabled: false },
-      env: { ...process.env, ENABLE_CLAUDEAI_MCP_SERVERS: "0" },
+      env: {
+        ...process.env,
+        // Bridge sets this globally, but it also blocks the usage endpoint.
+        // Clear it only in this helper ("0" is still truthy in Claude Code).
+        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "",
+        DISABLE_TELEMETRY: "1",
+        DISABLE_ERROR_REPORTING: "1",
+        DISABLE_AUTOUPDATER: "1",
+        DISABLE_FEEDBACK_COMMAND: "1",
+        ENABLE_CLAUDEAI_MCP_SERVERS: "0",
+      },
       ...(typeof provider.pathToClaudeCodeExecutable === "string" && provider.pathToClaudeCodeExecutable
         ? { pathToClaudeCodeExecutable: provider.pathToClaudeCodeExecutable } : {}),
     },
