@@ -399,30 +399,30 @@ test("Codex and Antigravity still show model-specific quotas and keep compact re
   assert.equal(requests.length, 3);
 });
 
-test("git branch follows provider, updates from Pi, and has an independent persistent display switch", async t => {
+test("git branch follows provider without a prefix, updates from Pi, and has an independent persistent display switch", async t => {
   const f = await fixture(t, "unsupported");
   const clock = speedClock(t, f);
   await clock.complete(10, 1000);
-  assert.deepEqual(f.render().split(" · ").slice(0, 4), ["test-unsupported", "unsupported", "git main", "remote worker"]);
+  assert.deepEqual(f.render().split(" · ").slice(0, 4), ["test-unsupported", "unsupported", "main", "remote worker"]);
   const redraws = f.redraws;
   f.changeBranch("feature/statusline");
   assert.ok(f.redraws > redraws, "Git branch changes request a redraw without waiting for the footer timer");
-  assert.match(f.render(), /unsupported · git feature\/statusline · remote worker/);
+  assert.match(f.render(), /unsupported · feature\/statusline · remote worker/);
   assertSpeeds(f, 10); // A Git checkout is not a conversation-tree change.
   await f.command("provider off");
-  assert.deepEqual(f.render().split(" · ").slice(0, 3), ["test-unsupported", "git feature/statusline", "remote worker"]);
+  assert.deepEqual(f.render().split(" · ").slice(0, 3), ["test-unsupported", "feature/statusline", "remote worker"]);
   await f.command("git-branch off");
   const hiddenRedraws = f.redraws, hiddenReads = f.branchReads;
   f.changeBranch("fix/updated-while-hidden");
   assert.equal(f.redraws, hiddenRedraws);
-  assert.doesNotMatch(f.render(), /git |feature\/statusline|updated-while-hidden/);
+  assert.doesNotMatch(f.render(), /feature\/statusline|updated-while-hidden/);
   assert.equal(f.branchReads, hiddenReads, "Hidden branches are not queried during render");
   assert.deepEqual((await readSettings()).statusline, { provider: false, "git-branch": false });
   await f.emit("session_shutdown");
   await f.emit("session_start");
-  assert.doesNotMatch(f.render(), /git /);
+  assert.doesNotMatch(f.render(), /updated-while-hidden/);
   await f.command("git-branch on");
-  assert.match(f.render(), /git fix\/updated-while-hidden · remote worker/);
+  assert.match(f.render(), /fix\/updated-while-hidden · remote worker/);
   assert.deepEqual((await readSettings()).statusline, { provider: false, "git-branch": true });
   await f.command("status");
   assert.match(f.notifications.at(-1).message, /git-branch\s+\[X\]/);
@@ -434,12 +434,12 @@ test("git branch handles no repository, detached HEAD, and long Unicode names at
   await writeSettings({ statusline: { ...fieldSettings(false), "git-branch": true } });
   const f = await fixture(t, "unsupported");
   f.changeBranch(null);
-  assert.equal(f.render(), "git —");
+  assert.equal(f.render(), "—");
   f.changeBranch("detached");
-  assert.equal(f.render(), "git detached");
+  assert.equal(f.render(), "detached");
   const branch = `feature/${"很長的分支名稱-".repeat(40)}`;
   f.changeBranch(branch);
-  assert.equal(f.render(1000), `git ${branch}`);
+  assert.equal(f.render(1000), branch);
   for (const mode of ["truecolor", "256color"]) {
     f.theme.getColorMode = () => mode;
     for (const width of [1, 10, 24, 40, 80]) {
@@ -463,7 +463,7 @@ test("git branch subscriptions are released when replacing the footer or closing
   assert.equal(f.redraws, redraws);
   await f.emit("session_start");
   assert.equal(f.branchListenerCount, 1);
-  assert.match(f.render(), /git after-dispose/);
+  assert.equal(f.render().split(" · ")[2], "after-dispose");
   await f.emit("session_shutdown");
   await f.emit("session_shutdown");
   assert.equal(f.branchListenerCount, 0);
@@ -761,7 +761,7 @@ test("each of the ten fields can be the only visible field, and all-off leaves n
   const requests = t.mock.method(globalThis, "fetch", async () => Response.json(balancePayload("12.34")));
   const f = await fixture(t);
   f.ctx.model.id = "model-fixture"; f.ctx.thinkingLevel = "high";
-  const expected = ["model-fixture high", "deepseek", "git main", "remote worker", "8% context used", "USD 12.34 left", "10K used", "128K window", "last — tok/s", "avg5 — tok/s"];
+  const expected = ["model-fixture high", "deepseek", "main", "remote worker", "8% context used", "USD 12.34 left", "10K used", "128K window", "last — tok/s", "avg5 — tok/s"];
   assert.deepEqual(f.raw(500), []); assert.equal(requests.mock.callCount(), 0);
   for (const [index, id] of fieldIds.entries()) {
     await f.command(`${id} on`);

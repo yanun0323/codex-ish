@@ -2438,8 +2438,8 @@ export default function codexIsh(pi: ExtensionAPI) {
           );
           const branch = statuslineSettings["git-branch"] ? footerData.getGitBranch() : null;
           const gitBranch = branch
-            ? paint(`git ${branch}`, CODEX_STATUS_COLORS.metadata)
-            : theme.fg("dim", "git —");
+            ? paint(branch, CODEX_STATUS_COLORS.metadata)
+            : theme.fg("dim", "—");
           const remoteFull = paint(remoteControl.footerText(), CODEX_STATUS_COLORS.metadata);
 
           const usage = ctx.getContextUsage();

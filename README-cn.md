@@ -48,7 +48,7 @@ pi install git:github.com/yanun0323/codex-ish
 - **DeepSeek API**：使用当前模型在 Pi 中的凭证，显示 USD 剩余额度。仅支持官方 `api.deepseek.com`；没有 USD 余额时显示 `n/a`，不会自行换算人民币。
 - **Claude Bridge（`pi-claude-bridge`）**：通过 bridge 已安装的 Claude Agent SDK 与 Claude Code 登录，显示 5 小时和每周剩余百分比、重置倒计时。后台辅助进程仅查询额度，不发送模型提示，也不扫描对话记录。SDK 的额度接口仍属实验功能；版本或登录方式不支持时显示 `-`，必要时请更新 bridge 并执行 `/reload`。
 - `/statusline` 会打开十个独立的字段复选框，默认均开启：`model-with-thinking`、`provider`、`git-branch`、`remote`、`context-used-percentage`、`quota-reset`、`context-used-tokens`、`context-window-tokens`、`output-speed`、`output-speed-avg5`。用 ↑/↓ 选择、Enter/空格键切换、Esc 关闭；更改会立即保存。也可运行 `/statusline <field> on|off`，或用 `/statusline status` 查看设置。旧版按 provider 分别开关的设置不再生效。
-- `git-branch` 显示当前 Git 分支（例如 `git main`），紧接在 `provider` 后面，并有独立的显示开关。会沿用 Pi 的分支变更通知自动更新。Detached HEAD 显示 `git detached`；无法获取分支或目录不在 Git 仓库内时，显示 `git —`。
+- `git-branch` 仅显示当前 Git 分支名称（例如 `main`），紧接在 `provider` 后面，并有独立的显示开关。会沿用 Pi 的分支变更通知自动更新。Detached HEAD 显示 `detached`；无法获取分支或目录不在 Git 仓库内时，显示 `—`。
 - `output-speed`（`last 42.6 tok/s`）与 `output-speed-avg5`（`avg5 39.8 tok/s`）依次放在 `context-window-tokens` 后面，各有独立的显示开关。仅在主对话的每次模型回复完成后更新，以回报的输出 token（包含思考）除以从该次模型回合开始计算的秒数。包含初始等待，不含 Pi 工具执行与空闲时间。`avg5` 是最近五次有效回复速度相加后除以次数；不足五次就使用已有的次数。失败、取消或未回报正数输出 token 的回复不纳入；没有样本时显示 `—`。隐藏任一字段都不会停止计算。样本仅保留在内存中，切换模型、对话分支、会话或重新加载时会清空。
 - `quota-reset` 仅显示**当前 provider** 的余额或剩余额度与重置倒计时，每 60 秒刷新。关闭此字段、切换模型或结束会话时，会取消查询并关闭 Claude 辅助进程。其他复选框仅影响字段显示；隐藏 `remote` 不会停止 Remote Control。精简显示仍保留重置倒计时；颜色会自动适配 truecolor 或 ANSI-256 终端。
 
