@@ -477,7 +477,7 @@ test("git branch subscriptions are released when replacing the footer or closing
   assert.equal(f.redraws, redraws);
 });
 
-test("completed response speeds start at the first content chunk, include thinking, and exclude initial wait, tools, and idle time", async t => {
+test("effective response speeds include initial wait and thinking, but exclude tools and idle time", async t => {
   const f = await fixture(t, "unsupported");
   const clock = speedClock(t, f);
   assertSpeeds(f);
@@ -487,7 +487,7 @@ test("completed response speeds start at the first content chunk, include thinki
   const user = { role: "user", content: "question", timestamp: 0 };
   await f.emit("message_start", { message: user });
   await f.emit("message_end", { message: user });
-  // Neither waiting before message_start nor waiting for the first content counts.
+  // Both waiting before message_start and waiting for the first content count.
   clock.now += 9000;
   const message = clock.message(100, {
     stopReason: "toolUse",
@@ -506,7 +506,7 @@ test("completed response speeds start at the first content chunk, include thinki
   assertSpeeds(f);
   const redraws = f.redraws;
   await f.emit("message_end", { message });
-  assertSpeeds(f, 50);
+  assertSpeeds(f, 100 / 16);
   assert.ok(f.redraws > redraws, "Completion redraws the footer immediately");
   clock.now += 90_000;
   const tool = { role: "toolResult", toolCallId: "call", toolName: "read", isError: false, timestamp: 0,
@@ -514,17 +514,17 @@ test("completed response speeds start at the first content chunk, include thinki
   await f.emit("message_start", { message: tool });
   await f.emit("message_end", { message: tool });
   await f.emit("turn_end");
-  assertSpeeds(f, 50);
+  assertSpeeds(f, 100 / 16);
   clock.now += 120_000;
   await clock.complete(100, 1000);
-  assertSpeeds(f, 100, 75); // Arithmetic mean, not 200 tokens / 3 seconds.
+  assertSpeeds(f, 100, 200 / 17); // Total tokens / total response time, without the tool or idle gaps.
   await clock.delta(message); // A late chunk cannot reopen an already completed turn.
   await f.emit("message_end", { message });
-  assertSpeeds(f, 100, 75);
+  assertSpeeds(f, 100, 200 / 17);
   assert.deepEqual(f.authCalls, [], "Measuring speeds never queries the provider");
 });
 
-test("only non-empty text, thinking, or tool-call deltas from the current response start its clock", async t => {
+test("stream metadata and text, thinking, or tool-call deltas do not change the turn-start clock", async t => {
   const f = await fixture(t, "unsupported");
   const clock = speedClock(t, f);
   for (const type of ["text_delta", "thinking_delta", "toolcall_delta"]) {
@@ -546,82 +546,127 @@ test("only non-empty text, thinking, or tool-call deltas from the current respon
     await clock.delta(message, type, "next");
     clock.now += 500;
     await f.emit("message_end", { message });
-    assertSpeeds(f, 40);
+    assertSpeeds(f, 40 / 11);
   }
 });
 
-test("non-streamed, single-chunk, and buffered responses do not create speed samples or evict valid history", async t => {
+test("non-streamed, single-chunk, and buffered replies use the whole response time without a stream-span threshold", async t => {
   const f = await fixture(t, "unsupported");
   const clock = speedClock(t, f);
-  for (const previous of [undefined, 10]) {
-    if (previous !== undefined) await clock.complete(previous, 1000);
-    for (const offsets of [[], [0], [0, 0], [0, 0.01, 0.02], [0, 99]]) {
-      const message = clock.message(1000);
-      await clock.start(message);
-      const first = clock.now + 5000;
-      for (const offset of offsets) {
-        clock.now = first + offset;
-        await clock.delta(message);
-      }
-      // A delayed completion must not make a single/buffered batch look measurable.
-      clock.now = first + 5000;
-      await f.emit("message_end", { message });
-      await f.emit("turn_end");
-      assertSpeeds(f, previous);
+  for (const offsets of [[], [0], [0, 0], [0, 0.01, 0.02], [0, 99]]) {
+    const message = clock.message(1000);
+    await f.emit("turn_start");
+    const startedAt = clock.now;
+    // Bridge/non-streaming providers can emit message_start only after most of the wait.
+    clock.now += 5000;
+    await f.emit("message_start", { message });
+    for (const offset of offsets) {
+      clock.now = startedAt + 5000 + offset;
+      await clock.delta(message);
     }
+    clock.now = startedAt + 10_000;
+    await f.emit("message_end", { message });
+    await f.emit("turn_end");
+    assertSpeeds(f, 100);
   }
-  await clock.complete(10, 100); // The minimum observable stream span is inclusive.
-  assertSpeeds(f, 100, 55);
+  await f.emit("session_tree");
+  await clock.complete(10, 100);
+  await clock.complete(10, 25); // No arbitrary minimum response time or speed cap.
+  assertSpeeds(f, 400, 20 / 0.125);
 });
 
-test("reported thinking without thinking chunks is not misreported as fast text generation", async t => {
+test("thinking is included once even when reasoning counts or thinking chunks are absent", async t => {
   const f = await fixture(t, "unsupported");
   const clock = speedClock(t, f);
-  const message = clock.message(100);
-  message.usage.reasoning = 60;
-  await clock.start(message);
-  clock.now += 30_000;
-  await clock.delta(message);
-  clock.now += 1000;
-  await clock.delta(message);
-  await f.emit("message_end", { message });
-  assertSpeeds(f);
-  await clock.complete(20, 1000);
-  assertSpeeds(f, 20);
+  for (const reasoning of [undefined, 0, 60]) {
+    await f.emit("session_tree");
+    const message = clock.message(100);
+    if (reasoning !== undefined) message.usage.reasoning = reasoning;
+    await clock.start(message);
+    clock.now += 30_000;
+    await clock.delta(message);
+    clock.now += 1000;
+    await clock.delta(message);
+    await f.emit("message_end", { message });
+    assertSpeeds(f, 100 / 31);
+    await clock.complete(20, 1000);
+    assertSpeeds(f, 20, 120 / 32);
+  }
 });
 
-test("avg5 retains only five valid responses and averages unrounded rates", async t => {
+test("DeepSeek bursts, Claude summaries, and Codex summary separators cannot inflate effective speeds", async t => {
+  await writeSettings({ statusline: { "quota-reset": false } });
   const f = await fixture(t, "unsupported");
   const clock = speedClock(t, f);
-  for (let i = 1; i <= 6; i++) {
-    await clock.complete(i * 100, 10_000, { stopReason: i === 2 ? "toolUse" : i === 3 ? "length" : "stop" });
-    assertSpeeds(f, i * 10, i <= 5 ? (i + 1) * 5 : 40);
+  for (const scenario of [
+    { provider: "deepseek", output: 140, reasoning: 0, wait: 9800, tail: 200,
+      type: "toolcall_delta", delta: "{", lastType: "toolcall_delta", stopReason: "toolUse", expected: 14 },
+    { provider: "claude-bridge", output: 3200, reasoning: 3000, wait: 30_000, tail: 2000,
+      type: "thinking_delta", delta: "short summary", lastType: "text_delta", stopReason: "stop", expected: 100 },
+    { provider: "openai-codex", output: 1000, reasoning: 800, wait: 19_000, tail: 1000,
+      type: "thinking_delta", delta: "\n\n", lastType: "text_delta", stopReason: "stop", expected: 50 },
+  ]) {
+    await f.switch(scenario.provider);
+    const message = clock.message(scenario.output, { stopReason: scenario.stopReason });
+    message.usage.reasoning = scenario.reasoning;
+    await f.emit("turn_start");
+    clock.now += scenario.wait;
+    await f.emit("message_start", { message });
+    await clock.delta(message, scenario.type, scenario.delta);
+    clock.now += scenario.tail;
+    await clock.delta(message, scenario.lastType);
+    await f.emit("message_end", { message });
+    await f.emit("turn_end");
+    assertSpeeds(f, scenario.expected);
   }
+  assert.deepEqual(f.authCalls, [], "Speed measurement never requests provider credentials or APIs");
+});
+
+test("avg5 uses total tokens / total time for only the five latest valid responses without rounding samples", async t => {
+  const f = await fixture(t, "unsupported");
+  const clock = speedClock(t, f);
+  const samples = [[100, 10_000], [200, 1000], [300, 5000], [400, 20_000], [500, 2000], [600, 500]];
+  for (let i = 0; i < samples.length; i++) {
+    const [tokens, milliseconds] = samples[i];
+    await clock.complete(tokens, milliseconds, { stopReason: i === 1 ? "toolUse" : i === 2 ? "length" : "stop" });
+    const recent = samples.slice(Math.max(0, i - 4), i + 1);
+    const totalTokens = recent.reduce((sum, [count]) => sum + count, 0);
+    const totalMs = recent.reduce((sum, [, duration]) => sum + duration, 0);
+    assertSpeeds(f, tokens / (milliseconds / 1000), totalTokens / (totalMs / 1000));
+  }
+  await clock.complete(900, 1000, { stopReason: "error" });
+  assertSpeeds(f, undefined, 2000 / 28.5); // Invalid replies do not evict valid history.
+  await clock.complete(700, 1000);
+  assertSpeeds(f, 700, 2500 / 28.5);
+  await f.emit("session_tree");
+  await clock.complete(3000, 30_000);
+  await clock.complete(200, 125);
+  assertSpeeds(f, 1600, 3200 / 30.125); // A short burst does not have the same weight as a long reply.
   await f.emit("session_tree");
   await clock.complete(4, 100_000);
   await clock.complete(4, 100_000);
   await clock.complete(9, 100_000);
-  assertSpeeds(f, 0.1, 0.1); // (.04 + .04 + .09) / 3, not (0.0 + 0.0 + 0.1) / 3.
+  assertSpeeds(f, 0.1, 17 / 300); // The displayed 0.0, 0.0, 0.1 rates are never reused as samples.
 });
 
-test("speeds ignore unsuccessful responses, missing or invalid usage, and invalid durations", async t => {
+test("invalid latest replies clear last, preserve avg5, and cannot be confused with unrelated or duplicate completions", async t => {
   const f = await fixture(t, "unsupported");
   const clock = speedClock(t, f);
   await clock.complete(10, 1000);
   for (const stopReason of ["error", "aborted", "pending", "deferred"]) {
     await clock.complete(900, 1000, { stopReason });
-    assertSpeeds(f, 10);
+    assertSpeeds(f, undefined, 10);
   }
   for (const output of [undefined, null, 0, -1, 1.5, "100", NaN, Infinity, Number.MAX_VALUE]) {
     await clock.complete(output, 1000);
-    assertSpeeds(f, 10);
+    assertSpeeds(f, undefined, 10);
   }
   await clock.complete(900, 1000, { usage: undefined });
-  assertSpeeds(f, 10);
+  assertSpeeds(f, undefined, 10);
   for (const duration of [0, -1000, NaN, Infinity]) {
     clock.now = 10_000;
     await clock.complete(900, duration);
-    assertSpeeds(f, 10);
+    assertSpeeds(f, undefined, 10);
   }
   clock.now = 10_000;
   const next = clock.message(20);
@@ -629,7 +674,7 @@ test("speeds ignore unsuccessful responses, missing or invalid usage, and invali
   await clock.delta(next);
   for (const different of [{ timestamp: next.timestamp - 1 }, { model: "other" }, { provider: "other" }]) {
     await f.emit("message_end", { message: { ...next, ...different } });
-    assertSpeeds(f, 10);
+    assertSpeeds(f, undefined, 10);
   }
   clock.now += 1000;
   await clock.delta(next);
@@ -658,11 +703,35 @@ test("model changes reset both speeds and discard late completions without losin
   assertSpeeds(f);
   await clock.delta(current);
   await f.emit("message_end", { message: current });
-  assertSpeeds(f, 20);
+  assertSpeeds(f, 10);
   await f.switch("another", current.model); // Reselecting the same model is not a change.
-  assertSpeeds(f, 20);
+  assertSpeeds(f, 10);
   await f.switch("another", "different-model");
   assertSpeeds(f);
+});
+
+test("thinking-level changes reset both speeds and discard in-flight measurements, but reselection preserves them", async t => {
+  const f = await fixture(t, "unsupported");
+  const clock = speedClock(t, f);
+  await clock.complete(10, 1000);
+  await f.emit("thinking_level_select", { level: "off", previousLevel: "off" });
+  assertSpeeds(f, 10);
+  const old = clock.message(900);
+  await clock.start(old);
+  const redraws = f.redraws;
+  f.ctx.thinkingLevel = "high";
+  await f.emit("thinking_level_select", { level: "high", previousLevel: "off" });
+  assertSpeeds(f);
+  assert.ok(f.redraws > redraws, "Thinking-level changes redraw the cleared speeds");
+  const current = clock.message(20);
+  await clock.start(current);
+  clock.now += 1000;
+  await f.emit("message_end", { message: old });
+  assertSpeeds(f);
+  await f.emit("message_end", { message: current });
+  assertSpeeds(f, 20);
+  await f.emit("thinking_level_select", { level: "high", previousLevel: "high" });
+  assertSpeeds(f, 20);
 });
 
 test("branch and session changes clear speed history; ended turns cannot publish late results", async t => {
