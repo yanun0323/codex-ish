@@ -47,8 +47,8 @@ pi install git:github.com/yanun0323/codex-ish
 - **Antigravity (Google)**: 모델 가족별 할당량 그룹.
 - **DeepSeek API**: 선택한 모델의 Pi 인증 정보로 USD 잔액을 표시합니다. 공식 `api.deepseek.com`만 지원하며 USD 잔액이 없으면 `n/a`로 표시합니다. 위안화를 임의로 환산하지 않습니다.
 - **Claude Bridge (`pi-claude-bridge`)**: bridge에 설치된 Claude Agent SDK와 Claude Code 로그인을 사용해 5시간 및 주간 남은 비율과 초기화 카운트다운을 표시합니다. 대기 중인 보조 프로세스는 사용량만 조회하며 모델 프롬프트를 보내거나 대화 기록을 훑지 않습니다. SDK 사용량 API는 실험 기능이므로 지원하지 않는 버전이나 로그인 방식에서는 `-`를 표시합니다. 필요하면 bridge를 업데이트하고 `/reload`를 실행하세요.
-- **현재 provider만** 표시하고 조회합니다. 네 가지 표시는 기본적으로 켜져 있습니다. `/statusline` 메뉴에서 각각 전환하거나 `/statusline <codex|antigravity|deepseek|claude-bridge> on|off`를 실행하세요. `/statusline status`로 저장된 설정을 확인할 수 있습니다.
-- 활성화된 동안 60초마다 갱신합니다. 표시를 끄거나 모델을 바꾸거나 세션을 종료하면 조회를 취소하고 Claude 보조 프로세스를 종료합니다. 간결한 표시에서도 초기화 카운트다운을 유지하며 색상은 truecolor 또는 ANSI-256 터미널에 자동으로 맞춰집니다.
+- `/statusline`은 일곱 항목의 독립적인 체크박스를 열며 기본적으로 모두 켜져 있습니다: `model-with-thinking`, `provider`, `remote`, `context-used-percentage`, `quota-reset`, `context-used-tokens`, `context-window-tokens`. ↑/↓로 선택하고 Enter/Space로 전환하며 Esc로 닫습니다. 변경 사항은 바로 저장됩니다. `/statusline <field> on|off`로도 전환할 수 있으며 `/statusline status`로 설정을 확인합니다. 이전 버전의 provider별 스위치는 더 이상 적용되지 않습니다.
+- `quota-reset`은 **현재 provider**의 잔액 또는 남은 비율과 초기화 카운트다운만 표시하며 60초마다 갱신합니다. 이 항목을 끄거나 모델을 바꾸거나 세션을 종료하면 조회를 취소하고 Claude 보조 프로세스를 종료합니다. 다른 체크박스는 해당 항목의 표시만 바꾸므로 `remote`를 숨겨도 Remote Control은 중지되지 않습니다. 간결한 표시에서도 초기화 카운트다운을 유지하며 색상은 truecolor 또는 ANSI-256 터미널에 자동으로 맞춰집니다.
 
 ### ChatGPT Remote Control (`/remote`)
 
@@ -92,7 +92,7 @@ pi install git:github.com/yanun0323/codex-ish
 | 설정 | 위치 | 비고 |
 |---|---|---|
 | 빠른 모드 | `~/.pi/agent/codex-ish.json` | `/fast`가 저장 |
-| 상태줄 provider 표시 | `~/.pi/agent/codex-ish.json`의 `statusline` | `/statusline`이 저장하며 `/fast`와 독립적 |
+| 상태줄 표시 항목 | `~/.pi/agent/codex-ish.json`의 `statusline` | `/statusline`이 저장하며 `/fast`와 독립적 |
 | Remote 상태 디렉터리 | `~/.pi/agent/codex-ish-remote/` | `PI_CODEX_ISH_REMOTE_HOME`으로 재정의. 비공개로 유지하세요 |
 | Remote 자동 시작 | 환경 변수 | `PI_CODEX_APP_SERVER_AUTOSTART=0` 비활성화 |
 | Remote 로컬 연결 | Remote 디렉터리의 `host.sock` | 비공개 Unix socket. `PI_CODEX_APP_SERVER_LISTEN`은 더 이상 사용하지 않음 |

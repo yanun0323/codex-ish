@@ -54,7 +54,11 @@ const jiti = createJiti(import.meta.url, { alias: {
 const extension = await jiti.import(resolve(here, "..", "extensions", "codex-ish.ts"));
 const { parseDeepSeekBalance, fetchDeepSeekBalance, parseClaudeBridgeQuotas, parseStatuslineSettings } = extension;
 const { ClaudeUsageReader, CLAUDE_USAGE_METHOD } = await jiti.import(resolve(here, "..", "extensions", "lib", "claude-usage.ts"));
-const { visibleWidth } = await import(join(piRoot, "node_modules/@earendil-works/pi-tui/dist/index.js"));
+const { visibleWidth, getKeybindings } = await import(join(piRoot, "node_modules/@earendil-works/pi-tui/dist/index.js"));
+const { initTheme } = await import(join(piRoot, "dist/modes/interactive/theme/theme.js"));
+initTheme("dark", false);
+const fieldIds = ["model-with-thinking", "provider", "remote", "context-used-percentage", "quota-reset", "context-used-tokens", "context-window-tokens"];
+const fieldSettings = enabled => Object.fromEntries(fieldIds.map(id => [id, enabled]));
 const settingsPath = join(agentDir, "codex-ish.json");
 const writeSettings = settings => writeFile(settingsPath, JSON.stringify(settings));
 const readSettings = async () => JSON.parse(await readFile(settingsPath, "utf8"));
@@ -100,10 +104,11 @@ async function fixture(t, provider = "deepseek", mode = "tui") {
   extension.default({ registerTool() {}, registerCommand(name, command) { commands.set(name, command); },
     on(name, handler) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); return () => {}; } });
   let footer;
+  let menu;
   let redraws = 0;
   const notifications = [];
   const authCalls = [];
-  const theme = { fg: (_color, text) => text, getColorMode: () => "truecolor" };
+  const theme = { fg: (_color, text) => text, bold: text => text, getColorMode: () => "truecolor" };
   const ctx = {
     cwd, mode, hasUI: mode === "tui" || mode === "rpc", model: model(provider), thinkingLevel: "off",
     isIdle: () => true, getContextUsage: () => ({ tokens: 10000, contextWindow: 128000, percent: 8 }),
@@ -117,7 +122,12 @@ async function fixture(t, provider = "deepseek", mode = "tui") {
       notify: (message, level) => notifications.push({ message, level }), setWidget() {},
       getEditorComponent() {}, setEditorComponent() {}, addAutocompleteProvider() {}, getEditorText: () => "",
       setFooter(factory) { footer = factory?.({ requestRender() { redraws++; } }, theme); },
-      select: async () => { throw new Error("Test must supply selector choices"); },
+      select: async () => { throw new Error("Statusline should use a checkbox list, not a select dialog"); },
+      custom: factory => new Promise(done => {
+        menu = factory({ terminal: { rows: 24 }, requestRender() { redraws++; } }, theme, getKeybindings(), () => {
+          menu?.dispose?.(); menu = undefined; done();
+        });
+      }),
     },
   };
   const emit = async (name, event = {}) => { for (const handler of handlers.get(name) ?? []) await handler(event, ctx); };
@@ -127,6 +137,8 @@ async function fixture(t, provider = "deepseek", mode = "tui") {
     command: args => commands.get("statusline").handler(args, ctx),
     render: (width = 500) => stripVTControlCharacters(footer?.render(width).join("\n") ?? ""),
     raw: width => footer?.render(width) ?? [],
+    get menu() { return menu; },
+    renderMenu: (width = 80) => stripVTControlCharacters(menu?.render(width).join("\n") ?? ""),
     get redraws() { return redraws; },
     switch: async (provider, id) => {
       const previousModel = ctx.model;
@@ -224,12 +236,15 @@ test("Claude usage converts documented percentages (not fractions) and ISO reset
     { weekly: { remaining: 0, resetAt: undefined } });
 });
 
-test("visibility defaults are backward-compatible and accept only explicit false", () => {
-  const defaults = { codex: true, antigravity: true, deepseek: true, "claude-bridge": true };
-  for (const value of [undefined, null, [], { fast: true }, { deepseek: "false", codex: 0 }]) {
+test("seven field switches default to on, use explicit false, and ignore old provider switches", () => {
+  const defaults = fieldSettings(true);
+  for (const value of [undefined, null, [], { fast: true }, { provider: "false", remote: 0 },
+    { codex: false, antigravity: false, deepseek: false, "claude-bridge": false }]) {
     assert.deepEqual(parseStatuslineSettings(value), defaults);
   }
-  assert.deepEqual(parseStatuslineSettings({ deepseek: false, "claude-bridge": false, unknown: false }), { ...defaults, deepseek: false, "claude-bridge": false });
+  assert.deepEqual(parseStatuslineSettings({ provider: false, "quota-reset": false, unknown: false }),
+    { ...defaults, provider: false, "quota-reset": false });
+  assert.deepEqual(parseStatuslineSettings(fieldSettings(false)), fieldSettings(false));
 });
 
 // The Claude reader never submits a prompt, spawns only once, and owns its cleanup.
@@ -340,65 +355,174 @@ test("Codex and Antigravity still show model-specific quotas and keep compact re
   assert.equal(requests.length, 3);
 });
 
-test("/statusline persists individual switches, preserves /fast and unknown settings, and reloads", async t => {
-  await writeSettings({ fast: true, future: { keep: true }, statusline: { future: "keep" } });
+test("field switches persist across reload, preserve /fast, and replace obsolete provider switches", async t => {
+  await writeSettings({ fast: true, future: { keep: true }, statusline: { future: "keep", deepseek: false, "claude-bridge": false } });
   t.mock.method(globalThis, "fetch", async () => Response.json(balancePayload("1")));
   const f = await fixture(t);
   await eventually(() => f.render().includes("USD 1.00"));
-  await f.command("deepseek off"); assert.doesNotMatch(f.render(), /USD|5h|weekly/);
-  await f.command("claude-bridge off");
-  assert.deepEqual(await readSettings(), { fast: true, future: { keep: true }, statusline: { future: "keep", deepseek: false, "claude-bridge": false } });
-  await f.command("codex off");
+  await f.command("quota-reset off"); assert.doesNotMatch(f.render(), /USD|5h|weekly/);
+  await f.command("remote off"); assert.doesNotMatch(f.render(), /remote/);
+  assert.deepEqual(await readSettings(), { fast: true, future: { keep: true }, statusline: { future: "keep", "quota-reset": false, remote: false } });
+  await f.command("model-with-thinking off");
   await f.switch("openai-codex");
   await f.commands.get("fast").handler("off", f.ctx);
   assert.equal((await readSettings()).fast, false);
-  assert.equal((await readSettings()).statusline.deepseek, false);
+  assert.equal((await readSettings()).statusline["quota-reset"], false);
   await f.emit("session_shutdown");
   const restored = await fixture(t);
-  assert.doesNotMatch(restored.render(), /USD|5h|weekly/);
+  assert.doesNotMatch(restored.render(), /USD|5h|weekly|remote|test-deepseek/);
   assert.equal(restored.authCalls.length, 0);
-  await restored.command("deepseek");
+  await restored.command("quota-reset");
   await eventually(() => restored.render().includes("USD 1.00"));
-  assert.equal((await readSettings()).statusline.deepseek, true);
+  assert.equal((await readSettings()).statusline["quota-reset"], true);
   assert.equal((await readdir(agentDir)).some(name => name.endsWith(".tmp")), false);
 });
 
-test("/statusline selector toggles all four providers, shows state, and supports Done/cancel", async t => {
+test("/statusline is a seven-field checkbox menu with aligned values and keyboard toggles", async t => {
   const f = await fixture(t, "unsupported");
-  let step = 0;
-  f.ctx.ui.select = async (title, choices) => {
-    assert.match(title, /only the current provider/);
-    assert.equal(choices.length, 5);
-    const index = step++;
-    if (index === 4) { assert.ok(choices.slice(0, 4).every(choice => choice.endsWith(": off"))); return "Done"; }
-    assert.match(choices[index], /: on$/);
-    return choices[index];
-  };
-  await f.command("");
-  assert.deepEqual((await readSettings()).statusline, { codex: false, antigravity: false, deepseek: false, "claude-bridge": false });
+  const opened = f.command("");
+  const lines = f.renderMenu().split("\n").filter(line => line.includes("[X]"));
+  assert.equal(lines.length, 7);
+  for (const [index, id] of fieldIds.entries()) assert.ok(lines[index].includes(id));
+  assert.equal(new Set(lines.map(line => line.indexOf("[X]"))).size, 1, "Checkboxes align");
+  assert.doesNotMatch(f.renderMenu(), /Codex quota|Antigravity|DeepSeek|Claude Bridge/);
+  for (const [index, id] of fieldIds.entries()) {
+    f.menu.handleInput(index % 2 ? "\r" : " ");
+    await eventually(() => !f.renderMenu().includes("Saving…"));
+    assert.match(f.renderMenu().split("\n").find(line => line.includes(id)), /\[ \]/);
+    f.menu.handleInput("\x1b[B");
+  }
+  f.menu.handleInput("\x1b"); await opened;
+  assert.equal(f.menu, undefined);
+  assert.deepEqual((await readSettings()).statusline, fieldSettings(false));
+  assert.deepEqual(f.raw(500), []);
   await f.command("status");
-  assert.match(f.notifications.at(-1).message, /DeepSeek balance \(USD\): off/);
+  assert.equal(f.notifications.at(-1).message.match(/\[ \]/g).length, 7);
   const before = await readFile(settingsPath, "utf8");
-  f.ctx.ui.select = async () => undefined;
-  await f.command(""); assert.equal(await readFile(settingsPath, "utf8"), before);
-  await f.command("deepseek invalid"); assert.equal(f.notifications.at(-1).level, "warning");
-  await f.command("deepseek on extra"); assert.equal(await readFile(settingsPath, "utf8"), before);
-  assert.deepEqual(f.commands.get("statusline").getArgumentCompletions("deepseek ").map(item => item.value), ["deepseek on", "deepseek off"]);
+  const cancelled = f.command(""); f.menu.handleInput("\x03"); await cancelled;
+  assert.equal(await readFile(settingsPath, "utf8"), before);
+  for (const args of ["deepseek off", "provider invalid", "provider on extra"]) {
+    await f.command(args); assert.equal(f.notifications.at(-1).level, "warning");
+  }
+  assert.equal(await readFile(settingsPath, "utf8"), before);
+  assert.deepEqual(f.commands.get("statusline").getArgumentCompletions("quota-reset ").map(item => item.value), ["quota-reset on", "quota-reset off"]);
 });
 
-test("settings saves serialize patches and refuse to overwrite corrupt or unwritable settings", async t => {
+test("checkbox menu saves rapid toggles in order and waits for them before closing", async t => {
   const f = await fixture(t, "unsupported");
-  await Promise.all([f.command("deepseek off"), f.command("claude-bridge off")]);
-  assert.deepEqual((await readSettings()).statusline, { deepseek: false, "claude-bridge": false });
+  const opened = f.command("");
+  f.menu.handleInput(" "); f.menu.handleInput(" ");
+  f.menu.handleInput("\x1b[B"); f.menu.handleInput(" ");
+  f.menu.handleInput("\x1b"); await opened;
+  assert.deepEqual((await readSettings()).statusline, { "model-with-thinking": true, provider: false });
+  assert.match(f.render(), /test-unsupported/);
+  assert.ok(!f.render().split(" · ").includes("unsupported"));
+});
+
+test("checkbox menu rolls back failed saves and remains usable", async t => {
+  const f = await fixture(t, "unsupported");
+  await writeFile(settingsPath, "{broken");
+  const opened = f.command("");
+  f.menu.handleInput(" ");
+  await eventually(() => f.notifications.some(item => item.level === "error"));
+  assert.match(f.renderMenu().split("\n").find(line => line.includes("model-with-thinking")), /\[X\]/);
+  assert.match(f.render(), /test-unsupported/);
+  assert.equal(await readFile(settingsPath, "utf8"), "{broken");
+  await writeSettings({});
+  f.menu.handleInput(" "); f.menu.handleInput("\x1b"); await opened;
+  assert.equal((await readSettings()).statusline["model-with-thinking"], false);
+});
+
+test("branch changes and shutdown close the menu and finish accepted saves", async t => {
+  for (const event of ["session_tree", "session_shutdown"]) {
+    await writeSettings({});
+    const f = await fixture(t, "unsupported");
+    const opened = f.command("");
+    f.menu.handleInput(" ");
+    await f.emit(event); await opened;
+    assert.equal(f.menu, undefined);
+    assert.equal((await readSettings()).statusline["model-with-thinking"], false);
+    if (event === "session_shutdown") assert.deepEqual(f.raw(500), []);
+  }
+});
+
+test("checkbox menu supports mouse input and narrow widths without hiding its checkbox column", async t => {
+  const f = await fixture(t, "unsupported");
+  const opened = f.command("");
+  for (const width of [1, 10, 24, 40, 80]) {
+    const lines = f.menu.render(width);
+    for (const line of lines) assert.ok(visibleWidth(line) <= width);
+    if (width >= 10) assert.equal(stripVTControlCharacters(lines.join("\n")).match(/\[X\]/g)?.length, 7);
+  }
+  f.menu.handleMouse({ type: "press", button: "left", x: 3, y: 4 });
+  f.menu.handleMouse({ type: "click", button: "left", x: 3, y: 4 });
+  await eventually(() => !f.renderMenu().includes("Saving…"));
+  assert.doesNotMatch(f.render(), /remote/);
+  f.menu.handleInput("\x1b"); await opened;
+  assert.deepEqual((await readSettings()).statusline, { remote: false });
+});
+
+test("each of the seven fields can be the only visible field, and all-off leaves no footer", async t => {
+  await writeSettings({ statusline: fieldSettings(false) });
+  const requests = t.mock.method(globalThis, "fetch", async () => Response.json(balancePayload("12.34")));
+  const f = await fixture(t);
+  f.ctx.model.id = "model-fixture"; f.ctx.thinkingLevel = "high";
+  const expected = ["model-fixture high", "deepseek", "remote worker", "8% context used", "USD 12.34 left", "10K used", "128K window"];
+  assert.deepEqual(f.raw(500), []); assert.equal(requests.mock.callCount(), 0);
+  for (const [index, id] of fieldIds.entries()) {
+    await f.command(`${id} on`);
+    if (id === "quota-reset") await eventually(() => f.render().includes("USD 12.34"));
+    assert.equal(f.render(), expected[index], id);
+    for (const width of [1, 10, 24, 80]) {
+      for (const line of f.raw(width)) assert.ok(visibleWidth(line) <= width);
+      assert.doesNotMatch(f.render(width), /·/);
+    }
+    await f.command(`${id} off`); assert.deepEqual(f.raw(500), []);
+  }
+  assert.equal(requests.mock.callCount(), 1, "Only the quota field triggers a query");
+  f.ctx.isIdle = () => false; f.ctx.ui.getEditorText = () => "queued message";
+  assert.match(f.render(), /tab\/enter to queue/, "Queue help is independent of the statusline fields");
+});
+
+test("hiding individual fields neither changes fast mode nor restarts quota polling", async t => {
+  await writeSettings({ fast: true });
+  const requests = t.mock.method(globalThis, "fetch", async () => Response.json({ rate_limit: {
+    primary_window: { used_percent: 30, limit_window_seconds: 18000, reset_after_seconds: 7200 },
+    secondary_window: { used_percent: 50, limit_window_seconds: 604800, reset_after_seconds: 259200 },
+  } }));
+  const f = await fixture(t, "openai-codex");
+  f.ctx.thinkingLevel = "high";
+  await eventually(() => f.render().includes("5h 70%"));
+  assert.match(f.render(), /test-openai-codex high fast/);
+  const full = f.render().split(" · ");
+  for (const [id, text] of [["model-with-thinking", full[0]], ["provider", full[1]], ["remote", full[2]],
+    ["context-used-percentage", full[3]], ["context-used-tokens", full.at(-2)], ["context-window-tokens", full.at(-1)]]) {
+    await f.command(`${id} off`);
+    assert.deepEqual(f.render().split(" · "), full.filter(part => part !== text));
+    await f.command(`${id} on`);
+  }
+  assert.equal((await readSettings()).fast, true);
+  assert.equal(requests.mock.callCount(), 1);
+  await f.command("model-with-thinking off"); await f.command("remote off");
+  await f.command("context-used-percentage off");
+  assert.doesNotMatch(f.render(80), /test-openai-codex|high|fast|remote|ctx|context/);
+  assert.match(f.render(80), /5h 70%/);
+  assert.doesNotMatch(f.render(80), /^ · | · $|·\s*·/);
+});
+
+test("settings saves serialize field patches and refuse to overwrite corrupt or unwritable settings", async t => {
+  const f = await fixture(t, "unsupported");
+  await Promise.all([f.command("provider off"), f.command("remote off")]);
+  assert.deepEqual((await readSettings()).statusline, { provider: false, remote: false });
   for (const contents of ["{broken", "null", "[]"]) {
     await writeFile(settingsPath, contents);
-    await f.command("deepseek on");
+    await f.command("provider on");
     assert.equal(await readFile(settingsPath, "utf8"), contents);
     assert.equal(f.notifications.at(-1).level, "error");
-    await f.command("status"); assert.match(f.notifications.at(-1).message, /DeepSeek balance \(USD\): off/);
+    await f.command("status"); assert.match(f.notifications.at(-1).message, /provider\s+\[ \]/);
   }
   await rm(settingsPath); await mkdir(settingsPath);
-  try { await f.command("deepseek on"); assert.equal(f.notifications.at(-1).level, "error"); }
+  try { await f.command("provider on"); assert.equal(f.notifications.at(-1).level, "error"); }
   finally { await rm(settingsPath, { recursive: true }); }
 });
 
@@ -412,10 +536,10 @@ test("switch/off/shutdown cancel in-flight fetches, ignore late results, and nev
   requests[0].gate.resolve(Response.json(balancePayload("999"))); await tick();
   assert.doesNotMatch(f.render(), /999|USD/);
   await f.switch("deepseek"); await eventually(() => requests.length === 2);
-  await f.command("deepseek off"); assert.equal(requests[1].options.signal.aborted, true);
+  await f.command("quota-reset off"); assert.equal(requests[1].options.signal.aborted, true);
   requests[1].gate.resolve(Response.json(balancePayload("888"))); await tick();
   assert.doesNotMatch(f.render(), /888|USD/);
-  await f.command("deepseek on"); await eventually(() => requests.length === 3);
+  await f.command("quota-reset on"); await eventually(() => requests.length === 3);
   await f.emit("session_shutdown"); assert.equal(requests[2].options.signal.aborted, true);
   const redraws = f.redraws;
   requests[2].gate.resolve(Response.json(balancePayload("777"))); await tick();
@@ -439,10 +563,28 @@ test("polling refreshes only the visible provider every minute and disabling rem
   await eventually(() => f.render().includes("USD 2.00"));
   assert.equal(calls, 2);
   assert.equal([...timers].filter(timer => timer.delay === 60_000).length, 1);
-  await f.command("deepseek off");
+  await f.command("quota-reset off");
   assert.equal([...timers].filter(timer => timer.delay === 60_000).length, 0);
   await f.switch("unsupported"); assert.equal(calls, 2);
   await f.emit("session_shutdown"); assert.equal(timers.size, 0);
+});
+
+test("the quota field switch applies to every provider rather than following old provider toggles", async t => {
+  await writeSettings({ statusline: { "quota-reset": false } });
+  const f = await fixture(t);
+  for (const provider of ["openai-codex", "antigravity", "claude-bridge", "deepseek"]) {
+    await f.switch(provider);
+    assert.doesNotMatch(f.render(), /USD|5h|weekly/);
+  }
+  assert.deepEqual(f.authCalls, []);
+  assert.equal(sdkFixture.unexpected, 0);
+  const requests = t.mock.method(globalThis, "fetch", async () => Response.json(balancePayload("3")));
+  await f.command("provider off");
+  assert.equal(requests.mock.callCount(), 0);
+  await f.command("quota-reset on");
+  await eventually(() => f.render().includes("USD 3.00"));
+  assert.equal(requests.mock.callCount(), 1);
+  assert.ok(!f.render().split(" · ").includes("deepseek"));
 });
 
 test("a replaced session ignores a late response even after the new session is running", async t => {
@@ -458,11 +600,12 @@ test("a replaced session ignores a late response even after the new session is r
 test("non-TUI sessions never fetch usage, but direct statusline commands still save settings", async t => {
   for (const mode of ["rpc", "json", "print"]) {
     const f = await fixture(t, "claude-bridge", mode);
-    await f.command("deepseek off");
+    await f.command("quota-reset off");
     await f.switch("deepseek");
     assert.equal(f.authCalls.length, 0); assert.equal(f.render(), "");
-    assert.equal((await readSettings()).statusline.deepseek, false);
-    if (mode !== "rpc") { await f.command(""); assert.equal(f.notifications.at(-1).level, "warning"); }
+    assert.equal((await readSettings()).statusline["quota-reset"], false);
+    await f.command(""); assert.equal(f.notifications.at(-1).level, "warning");
+    assert.equal(f.menu, undefined);
   }
 });
 
@@ -485,10 +628,10 @@ test("Claude Bridge uses the installed SDK and configured executable without pro
   await eventually(() => f.render().includes("5h 75% left 2h"));
   assert.match(f.render(), /weekly 40% left 3d/); assert.doesNotMatch(f.render(), /USD/);
   assert.equal(calls, 1); assert.equal(f.authCalls.length, 0);
-  await f.command("claude-bridge off");
+  await f.command("quota-reset off");
   assert.doesNotMatch(f.render(), /5h|weekly/); assert.equal(closes, 1);
   assert.deepEqual(await input, { done: true, value: undefined });
-  await f.command("claude-bridge on");
+  await f.command("quota-reset on");
   await eventually(() => f.render().includes("5h 75% left"));
   await f.switch("unsupported"); assert.equal(closes, 2);
 });
@@ -514,7 +657,7 @@ test("missing USD balance shows n/a, zero is real data, and footer fits narrow/A
       for (const line of f.raw(width)) assert.ok(visibleWidth(line) <= width, `Footer overflows ${width}`);
     }
   }
-  await f.command("deepseek off");
+  await f.command("quota-reset off");
   for (const width of [80, 120, 500]) {
     assert.doesNotMatch(f.render(width), /USD|5h|weekly|·\s*·/);
   }

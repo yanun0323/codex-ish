@@ -47,8 +47,8 @@ pi install git:github.com/yanun0323/codex-ish
 - **Antigravity（Google）**：モデルファミリー別の quota グループ。
 - **DeepSeek API**：選択中のモデルの Pi 認証情報で USD 残高を表示します。公式の `api.deepseek.com` のみ対応し、USD 残高がなければ `n/a` を表示します。人民元からの換算はしません。
 - **Claude Bridge（`pi-claude-bridge`）**：bridge にインストールされた Claude Agent SDK と Claude Code のログインを使い、5 時間・週単位の残り率とリセットまでの時間を表示します。待機中の補助プロセスが使用量だけを読み取り、モデルへのプロンプト送信や会話履歴の走査は行いません。SDK の使用量 API は実験的機能のため、非対応のバージョンやログイン方式では `-` を表示します。必要に応じて bridge を更新し、`/reload` を実行してください。
-- 表示・問い合わせは**現在のプロバイダーのみ**。4 つの表示は初期状態で有効です。`/statusline` メニューで個別に切り替えるか、`/statusline <codex|antigravity|deepseek|claude-bridge> on|off` を実行します。`/statusline status` で保存済みの設定を確認できます。
-- 有効な間は 60 秒ごとに更新します。表示を無効にしたとき、モデルの切り替え時、セッション終了時には問い合わせをキャンセルし、Claude の補助プロセスを終了します。コンパクト表示でもリセットまでの時間を保持し、色は truecolor または ANSI-256 ターミナルに自動対応します。
+- `/statusline` は 7 項目の独立したチェックボックスを開きます。初期状態はすべて有効です：`model-with-thinking`、`provider`、`remote`、`context-used-percentage`、`quota-reset`、`context-used-tokens`、`context-window-tokens`。↑/↓ で選択、Enter/Space で切り替え、Esc で閉じます。変更はその都度保存されます。`/statusline <field> on|off` でも切り替えられ、`/statusline status` で設定を確認できます。旧版のプロバイダー別スイッチは適用されません。
+- `quota-reset` は**現在のプロバイダー**の残高、または残り率とリセットまでの時間だけを表示し、60 秒ごとに更新します。この項目を無効にしたとき、モデルの切り替え時、セッション終了時には問い合わせをキャンセルし、Claude の補助プロセスを終了します。他のチェックボックスは表示だけを切り替え、`remote` を非表示にしても Remote Control は停止しません。コンパクト表示でもリセットまでの時間を保持し、色は truecolor または ANSI-256 ターミナルに自動対応します。
 
 ### ChatGPT Remote Control（`/remote`）
 
@@ -92,7 +92,7 @@ pi install git:github.com/yanun0323/codex-ish
 | 設定 | 場所 | 備考 |
 |---|---|---|
 | 高速モード | `~/.pi/agent/codex-ish.json` | `/fast` が書き込み |
-| ステータスラインのプロバイダー表示 | `~/.pi/agent/codex-ish.json` の `statusline` | `/statusline` が保存。`/fast` とは独立 |
+| ステータスラインの表示項目 | `~/.pi/agent/codex-ish.json` の `statusline` | `/statusline` が保存。`/fast` とは独立 |
 | Remote の状態ディレクトリ | `~/.pi/agent/codex-ish-remote/` | `PI_CODEX_ISH_REMOTE_HOME` で上書き。非公開に保ってください |
 | リモートの自動起動 | 環境変数 | `PI_CODEX_APP_SERVER_AUTOSTART=0` で無効 |
 | Remote のローカル接続 | Remote ディレクトリ内の `host.sock` | 非公開 Unix socket。`PI_CODEX_APP_SERVER_LISTEN` は使いません |
