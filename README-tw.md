@@ -75,6 +75,12 @@ pi install git:github.com/yanun0323/codex-ish
 
 `/fast on|off|status` 可切換 Codex 模型的 `service_tier: "priority"`。設定會存到 `~/.pi/agent/codex-ish.json`。
 
+### 自動壓縮對話
+
+- 因 context 用量達到門檻或超出上限而自動壓縮時，會使用**當前模型支援的最低 thinking 等級**。若支援 `off`，該次摘要就關閉 thinking。主對話、手動 `/compact` 與分支摘要的 thinking 不變。
+- 沿用 Pi 的摘要格式、保留近期訊息的範圍、檔案紀錄與用量統計。仍遵守已儲存的 Pi 重試設定，每次重試都使用相同的最低 thinking。
+- 如果你已在 Pi 關閉自動壓縮，不會替你開啟。取消或失敗時，不會改用較高 thinking 重跑，也不會儲存不完整的摘要。失敗後可用 `/compact`，以平常的 thinking 設定重試。
+
 ### Skill 提及（`$skill-name`）
 
 在編輯器輸入 `$` 即可自動補全已安裝的 skill。訊息中提及 `$some-skill` 時，會把該 skill 完整的 `SKILL.md` 注入 context，等於對單一則請求強制載入 skill。

@@ -4,6 +4,7 @@ import { mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { createRequire } from "node:module";
 import { ClaudeUsageReader, type ClaudeUsageQuery } from "./lib/claude-usage.js";
+import { registerAutoCompaction } from "./lib/auto-compaction.js";
 import { registerRemoteControl as installRemoteControl } from "../dist/remote/client.js";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join, resolve } from "node:path";
@@ -1829,6 +1830,7 @@ function registerRemoteControl(pi: ExtensionAPI) {
 }
 
 export default function codexIsh(pi: ExtensionAPI) {
+  registerAutoCompaction(pi, AGENT_DIR);
   registerWebSearch(pi);
   registerCodexImages(pi);
   const remoteControl = registerRemoteControl(pi);

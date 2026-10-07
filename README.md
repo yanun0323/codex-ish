@@ -75,6 +75,12 @@ Custom footer with model, provider, Git branch, remote-control state, context us
 
 `/fast on|off|status` toggles Codex's `service_tier: "priority"` for Codex models. Persisted in `~/.pi/agent/codex-ish.json`.
 
+### Automatic compaction
+
+- Automatic threshold/overflow compaction uses the **current model's lowest supported thinking level**. If the model supports `off`, thinking is disabled for that summary. Main-conversation thinking, manual `/compact`, and branch-summary thinking are unchanged.
+- Reuses Pi's summary format, retained-message boundary, file history, and usage accounting. Saved Pi retry settings still apply, with every retry using the same minimum thinking level.
+- Does not enable automatic compaction if you disabled it in Pi. Cancellation or failure never falls back to higher thinking or saves an incomplete summary. On failure, use `/compact` to retry with your normal thinking setting.
+
 ### Skill mentions (`$skill-name`)
 
 Type `$` in the editor to autocomplete installed skills. A message mentioning `$some-skill` gets that skill's full `SKILL.md` injected into context, so you can force-load a skill for one request.

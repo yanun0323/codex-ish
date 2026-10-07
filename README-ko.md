@@ -75,6 +75,12 @@ pi install git:github.com/yanun0323/codex-ish
 
 `/fast on|off|status`로 Codex 모델의 `service_tier: "priority"`를 전환합니다. 설정은 `~/.pi/agent/codex-ish.json`에 저장됩니다.
 
+### 자동 대화 압축
+
+- 컨텍스트 사용량이 임계값이나 한도를 넘어 자동으로 압축할 때는 **현재 모델이 지원하는 가장 낮은 thinking 수준**을 사용합니다. `off`를 지원하면 해당 요약에서 thinking을 끕니다. 메인 대화, 수동 `/compact`, 브랜치 요약의 thinking은 바꾸지 않습니다.
+- Pi의 요약 형식, 최근 메시지를 유지하는 범위, 파일 기록, 사용량 집계를 그대로 사용합니다. 저장된 Pi 재시도 설정을 따르며 모든 재시도에서도 같은 최저 thinking 수준을 유지합니다.
+- Pi에서 자동 압축을 꺼 두었다면 다시 켜지 않습니다. 취소되거나 실패해도 더 높은 thinking으로 다시 실행하거나 불완전한 요약을 저장하지 않습니다. 실패한 뒤에는 `/compact`로 평소 thinking 설정을 사용해 다시 시도할 수 있습니다.
+
 ### 스킬 언급 (`$skill-name`)
 
 편집기에서 `$`를 입력하면 설치된 스킬이 자동 완성됩니다. `$some-skill`을 언급한 메시지는 해당 스킬의 전체 `SKILL.md`를 컨텍스트에 주입하므로, 한 번의 요청에 스킬을 강제로 로드할 수 있습니다.
