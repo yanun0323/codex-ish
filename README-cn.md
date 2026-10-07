@@ -47,9 +47,10 @@ pi install git:github.com/yanun0323/codex-ish
 - **Antigravity（Google）**：按模型家族分组的额度。
 - **DeepSeek API**：使用当前模型在 Pi 中的凭证，显示 USD 剩余额度。仅支持官方 `api.deepseek.com`；没有 USD 余额时显示 `n/a`，不会自行换算人民币。
 - **Claude Bridge（`pi-claude-bridge`）**：通过 bridge 已安装的 Claude Agent SDK 与 Claude Code 登录，显示 5 小时和每周剩余百分比、重置倒计时。后台辅助进程仅查询额度，不发送模型提示，也不扫描对话记录。SDK 的额度接口仍属实验功能；版本或登录方式不支持时显示 `-`，必要时请更新 bridge 并执行 `/reload`。
-- `/statusline` 会打开十个独立的字段复选框，默认均开启：`model-with-thinking`、`provider`、`git-branch`、`remote`、`context-used-percentage`、`quota-reset`、`context-used-tokens`、`context-window-tokens`、`output-speed`、`output-speed-avg5`。用 ↑/↓ 选择、Enter/空格键切换、Esc 关闭；更改会立即保存。也可运行 `/statusline <field> on|off`，或用 `/statusline status` 查看设置。旧版按 provider 分别开关的设置不再生效。
-- `git-branch` 仅显示当前 Git 分支名称（例如 `main`），紧接在 `provider` 后面，并有独立的显示开关。会沿用 Pi 的分支变更通知自动更新。Detached HEAD 显示 `detached`；无法获取分支或目录不在 Git 仓库内时，显示 `—`。
-- `output-speed`（`last 42.6 tok/s`）与 `output-speed-avg5`（`avg5 39.8 tok/s`）依次放在 `context-window-tokens` 后面，各有独立的显示开关。显示的是**有效回复速度**，不是服务器内部的纯生成速度，仅在主对话的每次模型回复完成后更新。`last` 以报告的输出 token（包含思考，且只计算一次）除以从 Pi 的 `turn_start` 到对应 assistant `message_end` 的秒数。包含请求准备、初始等待和思考，不含后续 Pi 工具执行及空闲时间。思考摘要和片段到达时间不影响计时；没有流式输出、只有一段、分批送达或未公开思考内容的回复，都使用相同算法。`avg5` 是最近五次有效回复的总输出 token 除以总回复时间，不是各次速度的算术平均；不足五次就使用已有的样本。失败、取消、缺少有效正数输出 token，或耗时不是正数、不是有限值的回复不纳入：`last` 显示 `—`，不沿用旧结果；`avg5` 保留有效记录，没有记录时显示 `—`。隐藏任一字段都不会停止计算。样本仅保留在内存中，切换模型、思考级别、对话分支、会话或重新加载时会清空。
+- `/statusline` 会打开十个独立的字段复选框，默认均开启：`model-with-thinking`、`provider`、`git-branch`、`remote`、`context-used-percentage`、`quota-reset`、`context-used-tokens`、`context-window-tokens`、`output-speed`、`output-speed-avg5`。用 ↑/↓ 选择、`u` 将选中字段上移、`d` 下移、Enter/空格键切换显示、Esc 关闭。更改会立即保存；保存失败时恢复到最后成功保存的设置。也可运行 `/statusline <field> on|off`，或用 `/statusline status` 按显示顺序查看设置。旧版按 provider 分别开关的设置不再生效。
+- 顺序单独保存在 `statusline.order` 中。隐藏字段会保留位置；重复或未知的字段名会被忽略，遗漏或新增的字段会追加到末尾。未设置顺序或格式无效时，沿用上述默认顺序。菜单、`/statusline status` 与完整／精简状态栏使用相同顺序。也可用 `/statusline move <field> up|down` 移动字段，非交互模式同样适用；`/statusline reset-order` 只恢复默认顺序，不改变显示开关。排序不会重新查询额度或清空速度记录；5 小时与每周额度仍一起移动。
+- `git-branch` 仅显示当前 Git 分支名称（例如 `main`），默认紧接在 `provider` 后面，并有独立的显示开关。会沿用 Pi 的分支变更通知自动更新。Detached HEAD 显示 `detached`；无法获取分支或目录不在 Git 仓库内时，显示 `—`。
+- `output-speed`（`last 42.6 tok/s`）与 `output-speed-avg5`（`avg5 39.8 tok/s`）默认依次放在 `context-window-tokens` 后面，各有独立的显示开关。显示的是**有效回复速度**，不是服务器内部的纯生成速度，仅在主对话的每次模型回复完成后更新。`last` 以报告的输出 token（包含思考，且只计算一次）除以从 Pi 的 `turn_start` 到对应 assistant `message_end` 的秒数。包含请求准备、初始等待和思考，不含后续 Pi 工具执行及空闲时间。思考摘要和片段到达时间不影响计时；没有流式输出、只有一段、分批送达或未公开思考内容的回复，都使用相同算法。`avg5` 是最近五次有效回复的总输出 token 除以总回复时间，不是各次速度的算术平均；不足五次就使用已有的样本。失败、取消、缺少有效正数输出 token，或耗时不是正数、不是有限值的回复不纳入：`last` 显示 `—`，不沿用旧结果；`avg5` 保留有效记录，没有记录时显示 `—`。隐藏任一字段都不会停止计算。样本仅保留在内存中，切换模型、思考级别、对话分支、会话或重新加载时会清空。
 - `quota-reset` 仅显示**当前 provider** 的余额或剩余额度与重置倒计时，每 60 秒刷新。关闭此字段、切换模型或结束会话时，会取消查询并关闭 Claude 辅助进程。其他复选框仅影响字段显示；隐藏 `remote` 不会停止 Remote Control。精简显示仍保留重置倒计时；颜色会自动适配 truecolor 或 ANSI-256 终端。
 
 ### ChatGPT Remote Control（`/remote`）
@@ -94,7 +95,7 @@ pi install git:github.com/yanun0323/codex-ish
 | 配置 | 位置 | 说明 |
 |---|---|---|
 | 快速模式 | `~/.pi/agent/codex-ish.json` | 由 `/fast` 写入 |
-| 状态栏字段 | `~/.pi/agent/codex-ish.json` 中的 `statusline` | 由 `/statusline` 写入，不影响 `/fast` |
+| 状态栏字段与顺序 | `~/.pi/agent/codex-ish.json` 中的 `statusline` | 由 `/statusline` 写入；`statusline.order` 保存顺序，不影响 `/fast` |
 | Remote 服务目录 | `~/.pi/agent/codex-ish-remote/` | 可用 `PI_CODEX_ISH_REMOTE_HOME` 覆盖；请保持目录私密 |
 | Remote 自动启动 | 环境变量 | `PI_CODEX_APP_SERVER_AUTOSTART=0` 禁用 |
 | Remote 本地连接 | Remote 目录内的 `host.sock` | 私有 Unix socket；不再使用 `PI_CODEX_APP_SERVER_LISTEN` |

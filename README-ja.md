@@ -47,9 +47,10 @@ pi install git:github.com/yanun0323/codex-ish
 - **Antigravity（Google）**：モデルファミリー別の quota グループ。
 - **DeepSeek API**：選択中のモデルの Pi 認証情報で USD 残高を表示します。公式の `api.deepseek.com` のみ対応し、USD 残高がなければ `n/a` を表示します。人民元からの換算はしません。
 - **Claude Bridge（`pi-claude-bridge`）**：bridge にインストールされた Claude Agent SDK と Claude Code のログインを使い、5 時間・週単位の残り率とリセットまでの時間を表示します。待機中の補助プロセスが使用量だけを読み取り、モデルへのプロンプト送信や会話履歴の走査は行いません。SDK の使用量 API は実験的機能のため、非対応のバージョンやログイン方式では `-` を表示します。必要に応じて bridge を更新し、`/reload` を実行してください。
-- `/statusline` は 10 項目の独立したチェックボックスを開きます。初期状態はすべて有効です：`model-with-thinking`、`provider`、`git-branch`、`remote`、`context-used-percentage`、`quota-reset`、`context-used-tokens`、`context-window-tokens`、`output-speed`、`output-speed-avg5`。↑/↓ で選択、Enter/Space で切り替え、Esc で閉じます。変更はその都度保存されます。`/statusline <field> on|off` でも切り替えられ、`/statusline status` で設定を確認できます。旧版のプロバイダー別スイッチは適用されません。
-- `git-branch` は現在の Git ブランチ名（例：`main`）のみを `provider` の直後に表示し、個別に表示を切り替えられます。Pi のブランチ変更通知で自動更新します。Detached HEAD では `detached`、ブランチを取得できない場合や Git リポジトリ外では `—` を表示します。
-- `output-speed`（`last 42.6 tok/s`）と `output-speed-avg5`（`avg5 39.8 tok/s`）は、この順で `context-window-tokens` の後に表示され、それぞれ個別に表示を切り替えられます。表示するのはサーバー内部の純粋な生成速度ではなく、**実効応答速度**です。メインの会話でモデルの応答が完了したときだけ更新します。`last` は、報告された出力トークン数（思考を含み、重複加算しません）を、Pi の `turn_start` から対応する assistant の `message_end` までの秒数で割った値です。リクエストの準備、最初の待ち時間、思考を含み、その後の Pi のツール実行とアイドル時間は含みません。思考の要約や断片の到着時刻は計時に使わず、非ストリーミング、単一の断片、まとめて届く応答、思考内容が公開されない応答も同じ方法で計算します。`avg5` は直近 5 件の有効な応答の合計出力トークン数を合計応答時間で割った値で、各応答速度の算術平均ではありません。5 件未満なら存在するサンプルを使います。失敗・キャンセル、有効な正の出力トークン数がない応答、所要時間が正の有限値でない応答は除外し、`last` は古い値を残さず `—` を表示します。`avg5` は有効な履歴を保持し、履歴がなければ `—` を表示します。どちらの項目も非表示にしても計測は続きます。サンプルはメモリ内だけに保持し、モデル・思考レベル・会話のブランチ・セッションの切り替えや再読み込みでリセットします。
+- `/statusline` は 10 項目の独立したチェックボックスを開きます。初期状態はすべて有効です：`model-with-thinking`、`provider`、`git-branch`、`remote`、`context-used-percentage`、`quota-reset`、`context-used-tokens`、`context-window-tokens`、`output-speed`、`output-speed-avg5`。↑/↓ で選択、`u` で選択項目を上へ移動、`d` で下へ移動、Enter/Space で表示を切り替え、Esc で閉じます。変更はその都度保存され、保存に失敗すると最後に保存できた設定に戻ります。`/statusline <field> on|off` でも切り替えられ、`/statusline status` で表示順に設定を確認できます。旧版のプロバイダー別スイッチは適用されません。
+- 順序は `statusline.order` に別途保存します。非表示の項目も位置を保持し、重複・不明な項目名は無視し、欠けている項目や新しい項目は末尾に追加します。順序の設定がない場合や形式が無効な場合は、上記の既定順を使います。メニュー、`/statusline status`、通常・コンパクト表示で同じ順序を使います。`/statusline move <field> up|down` は非対話モードでも利用でき、`/statusline reset-order` は表示のオン・オフを変えずに順序だけを戻します。並べ替えても quota の再問い合わせや速度履歴のリセットは行わず、5 時間と週単位の quota は一緒に移動します。
+- `git-branch` は現在の Git ブランチ名（例：`main`）のみを、既定では `provider` の直後に表示し、個別に表示を切り替えられます。Pi のブランチ変更通知で自動更新します。Detached HEAD では `detached`、ブランチを取得できない場合や Git リポジトリ外では `—` を表示します。
+- `output-speed`（`last 42.6 tok/s`）と `output-speed-avg5`（`avg5 39.8 tok/s`）は、既定ではこの順で `context-window-tokens` の後に表示され、それぞれ個別に表示を切り替えられます。表示するのはサーバー内部の純粋な生成速度ではなく、**実効応答速度**です。メインの会話でモデルの応答が完了したときだけ更新します。`last` は、報告された出力トークン数（思考を含み、重複加算しません）を、Pi の `turn_start` から対応する assistant の `message_end` までの秒数で割った値です。リクエストの準備、最初の待ち時間、思考を含み、その後の Pi のツール実行とアイドル時間は含みません。思考の要約や断片の到着時刻は計時に使わず、非ストリーミング、単一の断片、まとめて届く応答、思考内容が公開されない応答も同じ方法で計算します。`avg5` は直近 5 件の有効な応答の合計出力トークン数を合計応答時間で割った値で、各応答速度の算術平均ではありません。5 件未満なら存在するサンプルを使います。失敗・キャンセル、有効な正の出力トークン数がない応答、所要時間が正の有限値でない応答は除外し、`last` は古い値を残さず `—` を表示します。`avg5` は有効な履歴を保持し、履歴がなければ `—` を表示します。どちらの項目も非表示にしても計測は続きます。サンプルはメモリ内だけに保持し、モデル・思考レベル・会話のブランチ・セッションの切り替えや再読み込みでリセットします。
 - `quota-reset` は**現在のプロバイダー**の残高、または残り率とリセットまでの時間だけを表示し、60 秒ごとに更新します。この項目を無効にしたとき、モデルの切り替え時、セッション終了時には問い合わせをキャンセルし、Claude の補助プロセスを終了します。他のチェックボックスは表示だけを切り替え、`remote` を非表示にしても Remote Control は停止しません。コンパクト表示でもリセットまでの時間を保持し、色は truecolor または ANSI-256 ターミナルに自動対応します。
 
 ### ChatGPT Remote Control（`/remote`）
@@ -94,7 +95,7 @@ pi install git:github.com/yanun0323/codex-ish
 | 設定 | 場所 | 備考 |
 |---|---|---|
 | 高速モード | `~/.pi/agent/codex-ish.json` | `/fast` が書き込み |
-| ステータスラインの表示項目 | `~/.pi/agent/codex-ish.json` の `statusline` | `/statusline` が保存。`/fast` とは独立 |
+| ステータスラインの表示項目と順序 | `~/.pi/agent/codex-ish.json` の `statusline` | `/statusline` が保存。順序は `statusline.order`。`/fast` とは独立 |
 | Remote の状態ディレクトリ | `~/.pi/agent/codex-ish-remote/` | `PI_CODEX_ISH_REMOTE_HOME` で上書き。非公開に保ってください |
 | リモートの自動起動 | 環境変数 | `PI_CODEX_APP_SERVER_AUTOSTART=0` で無効 |
 | Remote のローカル接続 | Remote ディレクトリ内の `host.sock` | 非公開 Unix socket。`PI_CODEX_APP_SERVER_LISTEN` は使いません |

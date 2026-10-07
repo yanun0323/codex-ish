@@ -25,7 +25,7 @@ import {
   createReadOnlyTools,
   CustomEditor,
   getMarkdownTheme,
-  getSettingsListTheme,
+  getSelectListTheme,
   stripFrontmatter,
   truncateHead,
   withFileMutationQueue,
@@ -44,7 +44,7 @@ import {
   Key,
   Markdown,
   matchesKey,
-  SettingsList,
+  SelectList,
   truncateToWidth,
   type TUI,
   type TuiMouseEvent,
@@ -311,6 +311,7 @@ const STATUSLINE_ITEMS = [
 type StatuslineSource = typeof STATUSLINE_SOURCES[number]["id"];
 type StatuslineItem = typeof STATUSLINE_ITEMS[number];
 type StatuslineSettings = Record<StatuslineItem, boolean>;
+type SettingsPatch = { fast?: boolean; statusline?: Partial<StatuslineSettings> & { order?: StatuslineItem[] } };
 type StatuslineData = { quotas?: Quotas; balance?: number };
 
 function statuslineSource(provider: string | undefined): StatuslineSource | undefined {
@@ -321,6 +322,22 @@ export function parseStatuslineSettings(value: unknown): StatuslineSettings {
   const settings = object(value);
   // The old per-provider switches do not control field visibility.
   return Object.fromEntries(STATUSLINE_ITEMS.map(id => [id, settings?.[id] !== false])) as StatuslineSettings;
+}
+
+export function parseStatuslineOrder(value: unknown): StatuslineItem[] {
+  const known = (Array.isArray(value) ? value : [])
+    .filter((id): id is StatuslineItem => STATUSLINE_ITEMS.some(item => item === id));
+  // Hidden fields keep their place; missing and newly added fields go at the end.
+  return [...new Set([...known, ...STATUSLINE_ITEMS])];
+}
+
+function moveStatuslineItem(order: readonly StatuslineItem[], id: StatuslineItem, direction: -1 | 1): StatuslineItem[] | undefined {
+  const index = order.indexOf(id);
+  const target = index + direction;
+  if (index < 0 || target < 0 || target >= order.length) return undefined;
+  const next = [...order];
+  [next[index], next[target]] = [next[target], next[index]];
+  return next;
 }
 
 function isNewLineShortcut(data: string): boolean {
@@ -554,9 +571,11 @@ async function readSettings(): Promise<Record<string, unknown>> {
   }
 }
 
-async function saveSettings(patch: { fast?: boolean; statusline?: Partial<StatuslineSettings> }): Promise<void> {
-  await withFileMutationQueue(SETTINGS_PATH, async () => {
+async function saveSettings(change: SettingsPatch | ((previous: Record<string, unknown>) => SettingsPatch | undefined)): Promise<Record<string, unknown>> {
+  return withFileMutationQueue(SETTINGS_PATH, async () => {
     const previous = await readSettings(); // Never overwrite unreadable or malformed settings.
+    const patch = typeof change === "function" ? change(previous) : change;
+    if (!patch) return previous;
     const statusline = { ...object(previous.statusline) };
     // Remove the superseded provider toggles when saving field preferences.
     for (const { id } of STATUSLINE_SOURCES) delete statusline[id];
@@ -571,6 +590,7 @@ async function saveSettings(patch: { fast?: boolean; statusline?: Partial<Status
     } finally {
       await rm(temporaryPath, { force: true });
     }
+    return settings;
   });
 }
 
@@ -1814,8 +1834,9 @@ export default function codexIsh(pi: ExtensionAPI) {
   const remoteControl = registerRemoteControl(pi);
   let fastEnabled = false;
   let statuslineSettings = parseStatuslineSettings(undefined);
+  let statuslineOrder = parseStatuslineOrder(undefined);
   let statuslineSession = 0;
-  let closeStatusline: (() => void) | undefined;
+  let closeStatusline: (() => Promise<void>) | undefined;
   let quotaState: QuotaState<StatuslineData> = { kind: "loading" };
   let refreshTimer: Timer | undefined;
   let refreshController: AbortController | undefined;
@@ -2001,7 +2022,7 @@ export default function codexIsh(pi: ExtensionAPI) {
   pi.on("session_tree", () => { resetOutputSpeeds(); redraw(); });
 
   let closeSide: (() => void) | undefined;
-  pi.on("session_tree", () => { closeSide?.(); closeStatusline?.(); });
+  pi.on("session_tree", () => { closeSide?.(); return closeStatusline?.(); });
   pi.on("session_shutdown", () => closeSide?.());
   const sideCommand: Parameters<ExtensionAPI["registerCommand"]>[1] = {
     description: "Ask questions and inspect files in a read-only side conversation",
@@ -2231,9 +2252,10 @@ export default function codexIsh(pi: ExtensionAPI) {
   pi.registerCommand("side", sideCommand);
 
   pi.registerCommand("statusline", {
-    description: "Show or hide individual statusline fields",
+    description: "Show, hide, or reorder statusline fields",
     getArgumentCompletions: prefix => {
-      const values = ["status", ...STATUSLINE_ITEMS.flatMap(id => [id, `${id} on`, `${id} off`])];
+      const values = ["status", "reset-order", ...STATUSLINE_ITEMS.flatMap(id => [id, `${id} on`, `${id} off`]),
+        ...STATUSLINE_ITEMS.flatMap(id => [`move ${id} up`, `move ${id} down`])];
       const matches = values.filter(value => value.startsWith(prefix.trimStart().toLowerCase()))
         .map(value => ({ value, label: value }));
       return matches.length ? matches : null;
@@ -2241,12 +2263,10 @@ export default function codexIsh(pi: ExtensionAPI) {
     handler: async (args, ctx) => {
       const session = statuslineSession;
       const checkbox = (id: StatuslineItem) => statuslineSettings[id] ? "[X]" : "[ ]";
+      const saveError = () => ctx.ui.notify("Unable to save statusline settings. Check codex-ish.json and the Pi config directory, then try again.", "error");
       const setVisible = async (id: StatuslineItem, enabled: boolean): Promise<boolean> => {
         try { await saveSettings({ statusline: { [id]: enabled } }); }
-        catch {
-          ctx.ui.notify("Unable to save statusline settings. Check codex-ish.json and the Pi config directory, then try again.", "error");
-          return false;
-        }
+        catch { saveError(); return false; }
         if (session !== statuslineSession) return true;
         const changed = statuslineSettings[id] !== enabled;
         statuslineSettings[id] = enabled;
@@ -2254,17 +2274,44 @@ export default function codexIsh(pi: ExtensionAPI) {
         else requestRender?.();
         return true;
       };
+      const setOrder = async (update: (order: StatuslineItem[]) => StatuslineItem[] | undefined): Promise<boolean> => {
+        try {
+          // Calculate command moves inside the file queue so concurrent moves accumulate.
+          const saved = await saveSettings(previous => {
+            const order = update(parseStatuslineOrder(object(previous.statusline)?.order));
+            return order ? { statusline: { order } } : undefined;
+          });
+          if (session === statuslineSession) {
+            statuslineOrder = parseStatuslineOrder(object(saved.statusline)?.order);
+            requestRender?.();
+          }
+          return true;
+        } catch { saveError(); return false; }
+      };
       const action = args.trim().toLowerCase();
       if (action === "status") {
         const labelWidth = Math.max(...STATUSLINE_ITEMS.map(id => id.length));
-        ctx.ui.notify(STATUSLINE_ITEMS.map(id => `${id.padEnd(labelWidth)}  ${checkbox(id)}`).join("\n"), "info");
+        ctx.ui.notify(statuslineOrder.map(id => `${id.padEnd(labelWidth)}  ${checkbox(id)}`).join("\n"), "info");
+        return;
+      }
+      if (action === "reset-order") {
+        if (await setOrder(() => [...STATUSLINE_ITEMS])) ctx.ui.notify("Statusline order reset. Field visibility is unchanged.", "info");
         return;
       }
       if (action) {
-        const [id, value, extra] = action.split(/\s+/);
-        const item = STATUSLINE_ITEMS.find(item => item === id);
-        if (!item || extra || value && value !== "on" && value !== "off") {
-          ctx.ui.notify("Use /statusline to choose fields, /statusline status, or /statusline <field> [on|off].", "warning");
+        const [id, value, direction, extra] = action.split(/\s+/);
+        const item = STATUSLINE_ITEMS.find(item => item === (id === "move" ? value : id));
+        if (id === "move" && item && !extra && (direction === "up" || direction === "down")) {
+          let moved = false;
+          if (await setOrder(order => {
+            const next = moveStatuslineItem(order, item, direction === "up" ? -1 : 1);
+            moved = next !== undefined;
+            return next;
+          })) ctx.ui.notify(moved ? `${item}: moved ${direction}.` : `${item}: already ${direction === "up" ? "first" : "last"}.`, "info");
+          return;
+        }
+        if (!item || id === "move" || direction || value && value !== "on" && value !== "off") {
+          ctx.ui.notify("Use /statusline, /statusline status, /statusline <field> [on|off], /statusline move <field> up|down, or /statusline reset-order.", "warning");
           return;
         }
         const enabled = value ? value === "on" : !statuslineSettings[item];
@@ -2272,7 +2319,7 @@ export default function codexIsh(pi: ExtensionAPI) {
         return;
       }
       if (ctx.mode !== "tui") {
-        ctx.ui.notify("Use /statusline <field> on|off or /statusline status outside interactive mode.", "warning");
+        ctx.ui.notify("Use /statusline <field> on|off, /statusline move <field> up|down, /statusline reset-order, or /statusline status outside interactive mode.", "warning");
         return;
       }
       await ctx.ui.custom<void>((tui, theme, keybindings, done) => {
@@ -2280,41 +2327,85 @@ export default function codexIsh(pi: ExtensionAPI) {
         let closing = false;
         let pending = 0;
         let saves = Promise.resolve();
+        let order = [...statuslineOrder];
+        let orderRevision = 0;
+        const visible = { ...statuslineSettings };
         const revisions = new Map<StatuslineItem, number>();
-        const close = () => {
-          if (closed || closing) return;
+        const close = async () => {
+          if (closed) return;
           closing = true;
-          // Finish accepted toggles before returning to the editor.
-          void saves.then(() => {
-            if (closed) return;
-            closed = true;
-            if (closeStatusline === close) closeStatusline = undefined;
-            done(undefined);
-          });
+          // Finish accepted changes before closing or loading another session's settings.
+          await saves;
+          if (closed) return;
+          closed = true;
+          if (closeStatusline === close) closeStatusline = undefined;
+          done(undefined);
         };
         closeStatusline = close;
-        const items = STATUSLINE_ITEMS.map(id => ({ id, label: String(id), currentValue: checkbox(id), values: ["[X]", "[ ]"] }));
-        const list = new SettingsList(items, Math.max(1, Math.min(items.length, tui.terminal.rows - 5)), getSettingsListTheme(), (id, value) => {
-          const item = id as StatuslineItem;
-          const revision = (revisions.get(item) ?? 0) + 1;
-          revisions.set(item, revision);
+        const enqueue = (save: () => Promise<void>) => {
           pending++;
-          saves = saves.then(async () => {
-            await setVisible(item, value === "[X]");
-            // Roll back failed saves without overwriting a newer queued toggle.
-            if (revisions.get(item) === revision) list.updateValue(item, checkbox(item));
-          }).finally(() => { pending--; if (!closed) tui.requestRender(); });
-        }, close);
+          saves = saves.then(save).finally(() => { pending--; if (!closed) tui.requestRender(); });
+        };
+        const toggle = (id: StatuslineItem) => {
+          const enabled = visible[id] = !visible[id];
+          const revision = (revisions.get(id) ?? 0) + 1;
+          revisions.set(id, revision);
+          enqueue(async () => {
+            await setVisible(id, enabled);
+            // Do not roll back a newer queued change when an older save finishes.
+            if (revisions.get(id) === revision) visible[id] = statuslineSettings[id];
+          });
+        };
+        let list: SelectList;
+        let maxVisible = 0;
+        const maxLabelWidth = Math.max(...STATUSLINE_ITEMS.map(id => id.length));
+        const visibleRows = () => Math.max(1, Math.min(order.length, tui.terminal.rows - 5));
+        const rebuildList = (selected: StatuslineItem) => {
+          maxVisible = visibleRows();
+          // SelectList exposes selection by ID, so keyboard, mouse, and reorder stay in sync.
+          list = new SelectList(order.map(id => ({ value: id, label: id })), maxVisible, getSelectListTheme(), {
+            truncatePrimary: ({ item, maxWidth }) => {
+              // Reserve the checkbox column even in a narrow terminal.
+              const labelWidth = Math.max(0, Math.min(maxLabelWidth, maxWidth - 5));
+              return `${truncateToWidth(item.value, labelWidth, "…").padEnd(labelWidth)}  ${visible[item.value as StatuslineItem] ? "[X]" : "[ ]"}`;
+            },
+          });
+          list.setSelectedIndex(order.indexOf(selected));
+          list.onSelect = item => toggle(item.value as StatuslineItem);
+          list.onCancel = close;
+        };
+        const selectedItem = () => list.getSelectedItem()!.value as StatuslineItem;
+        const move = (direction: -1 | 1) => {
+          const selected = selectedItem();
+          const next = moveStatuslineItem(order, selected, direction);
+          if (!next) return;
+          order = next;
+          rebuildList(selected);
+          const revision = ++orderRevision;
+          enqueue(async () => {
+            const saved = await setOrder(() => next);
+            // Successful saves leave the list intact, including a mouse press awaiting its click.
+            if (!saved && orderRevision === revision && session === statuslineSession) {
+              const selected = selectedItem();
+              order = [...statuslineOrder];
+              rebuildList(selected);
+            }
+          });
+        };
+        rebuildList(order[0]);
         return {
           handleInput(data) {
             if (closed || closing) return;
-            if (matchesKey(data, Key.ctrl("c")) || keybindings.matches(data, "tui.select.cancel")) close();
+            if (matchesKey(data, Key.ctrl("c")) || keybindings.matches(data, "tui.select.cancel")) void close();
+            else if (matchesKey(data, "u")) move(-1);
+            else if (matchesKey(data, "d")) move(1);
+            else if (matchesKey(data, Key.space)) toggle(selectedItem());
             else list.handleInput(data);
             tui.requestRender();
           },
           handleMouse(event) {
             if (closed || closing || event.y < 2) return undefined;
-            const result = list.handleMouse?.({ ...event, y: event.y - 2 });
+            const result = list.handleMouse({ ...event, y: event.y - 2 });
             if (result?.handled) tui.requestRender();
             return result;
           },
@@ -2324,10 +2415,9 @@ export default function codexIsh(pi: ExtensionAPI) {
             if (closeStatusline === close) closeStatusline = undefined;
           },
           render(width) {
-            // Keep the checkbox visible even when labels need to be shortened.
-            for (const item of items) item.label = truncateToWidth(item.id, Math.max(1, width - 9), "…");
-            const hint = pending ? "Saving…" : "↑/↓ move · Enter/Space toggle · Esc close";
-            return [theme.fg("accent", theme.bold("Statusline")), "", ...list.render(width).slice(0, -2), "", theme.fg("dim", hint)]
+            if (maxVisible !== visibleRows()) rebuildList(selectedItem());
+            const hint = pending ? "Saving…" : "↑/↓ select · u up · d down · Enter/Space toggle · Esc close";
+            return [theme.fg("accent", theme.bold("Statusline")), "", ...list.render(width), "", theme.fg("dim", hint)]
               .map(line => truncateToWidth(line, width, "…"));
           },
         };
@@ -2383,7 +2473,8 @@ export default function codexIsh(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     const session = ++statuslineSession;
-    closeStatusline?.();
+    await closeStatusline?.();
+    if (session !== statuslineSession) return;
     stopped = false;
     clearTimers();
     resetOutputSpeeds();
@@ -2392,6 +2483,7 @@ export default function codexIsh(pi: ExtensionAPI) {
     if (stopped || session !== statuslineSession) return;
     fastEnabled = settings.fast === true;
     statuslineSettings = parseStatuslineSettings(settings.statusline);
+    statuslineOrder = parseStatuslineOrder(object(settings.statusline)?.order);
 
     if (ctx.mode !== "tui") return;
 
@@ -2501,19 +2593,19 @@ export default function codexIsh(pi: ExtensionAPI) {
           };
 
           const line = (compact: boolean, weeklyLabel: string) => {
-            const fields: Array<[StatuslineItem, string[]]> = [
-              ["model-with-thinking", [modelFull]],
-              ["provider", [providerFull]],
-              ["git-branch", [gitBranch]],
-              ["remote", [remoteFull]],
-              ["context-used-percentage", [compact ? contextShort : contextFull]],
-              ["quota-reset", quotaParts(compact, weeklyLabel)],
-              ["context-used-tokens", [contextUsedTokens]],
-              ["context-window-tokens", [contextWindowTokens]],
-              ["output-speed", [outputSpeed]],
-              ["output-speed-avg5", [outputSpeedAverage]],
-            ];
-            return fields.flatMap(([id, parts]) => statuslineSettings[id] ? parts : []).join(separator);
+            const fields: Record<StatuslineItem, string[]> = {
+              "model-with-thinking": [modelFull],
+              provider: [providerFull],
+              "git-branch": [gitBranch],
+              remote: [remoteFull],
+              "context-used-percentage": [compact ? contextShort : contextFull],
+              "quota-reset": quotaParts(compact, weeklyLabel),
+              "context-used-tokens": [contextUsedTokens],
+              "context-window-tokens": [contextWindowTokens],
+              "output-speed": [outputSpeed],
+              "output-speed-avg5": [outputSpeedAverage],
+            };
+            return statuslineOrder.flatMap(id => statuslineSettings[id] ? fields[id] : []).join(separator);
           };
           const full = line(false, "weekly");
           if (!full) return [];
@@ -2530,9 +2622,9 @@ export default function codexIsh(pi: ExtensionAPI) {
     restartRefresh(ctx);
   });
 
-  pi.on("session_shutdown", (_event, ctx) => {
+  pi.on("session_shutdown", async (_event, ctx) => {
     statuslineSession++;
-    closeStatusline?.();
+    const closing = closeStatusline?.();
     stopped = true;
     clearTimers();
     resetOutputSpeeds();
@@ -2542,5 +2634,6 @@ export default function codexIsh(pi: ExtensionAPI) {
       ctx.ui.setFooter(undefined);
     }
     previousEditorFactory = undefined;
+    await closing;
   });
 }

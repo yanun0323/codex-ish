@@ -52,13 +52,20 @@ const jiti = createJiti(import.meta.url, { alias: {
   typebox: require.resolve("typebox"),
 } });
 const extension = await jiti.import(resolve(here, "..", "extensions", "codex-ish.ts"));
-const { parseDeepSeekBalance, fetchDeepSeekBalance, parseClaudeBridgeQuotas, parseStatuslineSettings } = extension;
+const { parseDeepSeekBalance, fetchDeepSeekBalance, parseClaudeBridgeQuotas, parseStatuslineSettings, parseStatuslineOrder } = extension;
 const { ClaudeUsageReader, CLAUDE_USAGE_METHOD } = await jiti.import(resolve(here, "..", "extensions", "lib", "claude-usage.ts"));
 const { visibleWidth, getKeybindings } = await import(join(piRoot, "node_modules/@earendil-works/pi-tui/dist/index.js"));
 const { initTheme } = await import(join(piRoot, "dist/modes/interactive/theme/theme.js"));
 initTheme("dark", false);
 const fieldIds = ["model-with-thinking", "provider", "git-branch", "remote", "context-used-percentage", "quota-reset", "context-used-tokens", "context-window-tokens", "output-speed", "output-speed-avg5"];
 const fieldSettings = enabled => Object.fromEntries(fieldIds.map(id => [id, enabled]));
+const fieldsFirst = (...ids) => [...ids, ...fieldIds.filter(id => !ids.includes(id))];
+const menuFields = f => f.renderMenu(100).split("\n").flatMap(line => line.match(/([\w-]+)\s+\[[X ]\]/)?.[1] ?? []);
+const selectedMenuField = f => f.renderMenu(100).match(/^→ ([\w-]+)/m)?.[1];
+const reportedOrder = async f => {
+  await f.command("status");
+  return f.notifications.at(-1).message.split("\n").map(line => line.split(/\s+/)[0]);
+};
 const settingsPath = join(agentDir, "codex-ish.json");
 const writeSettings = settings => writeFile(settingsPath, JSON.stringify(settings));
 const readSettings = async () => JSON.parse(await readFile(settingsPath, "utf8"));
@@ -115,6 +122,7 @@ async function fixture(t, provider = "deepseek", mode = "tui") {
   };
   const notifications = [];
   const authCalls = [];
+  const terminal = { rows: 24 };
   const theme = { fg: (_color, text) => text, bold: text => text, getColorMode: () => "truecolor" };
   const ctx = {
     cwd, mode, hasUI: mode === "tui" || mode === "rpc", model: model(provider), thinkingLevel: "off",
@@ -134,7 +142,7 @@ async function fixture(t, provider = "deepseek", mode = "tui") {
       },
       select: async () => { throw new Error("Statusline should use a checkbox list, not a select dialog"); },
       custom: factory => new Promise(done => {
-        menu = factory({ terminal: { rows: 24 }, requestRender() { redraws++; } }, theme, getKeybindings(), () => {
+        menu = factory({ terminal, requestRender() { redraws++; } }, theme, getKeybindings(), () => {
           menu?.dispose?.(); menu = undefined; done();
         });
       }),
@@ -143,7 +151,7 @@ async function fixture(t, provider = "deepseek", mode = "tui") {
   const emit = async (name, event = {}) => { for (const handler of handlers.get(name) ?? []) await handler(event, ctx); };
   t.after(() => emit("session_shutdown"));
   await emit("session_start");
-  return { ctx, commands, notifications, authCalls, theme, emit,
+  return { ctx, commands, notifications, authCalls, theme, terminal, emit,
     command: args => commands.get("statusline").handler(args, ctx),
     render: (width = 500) => stripVTControlCharacters(footer?.render(width).join("\n") ?? ""),
     raw: width => footer?.render(width) ?? [],
@@ -294,6 +302,17 @@ test("ten field switches default to on, use explicit false, and ignore old provi
   assert.deepEqual(parseStatuslineSettings({ provider: false, "quota-reset": false, unknown: false }),
     { ...defaults, provider: false, "quota-reset": false });
   assert.deepEqual(parseStatuslineSettings(fieldSettings(false)), fieldSettings(false));
+});
+
+test("field order defaults safely, removes duplicates and unknown IDs, and appends missing fields", () => {
+  for (const value of [undefined, null, false, "provider", {}, [], [null, false, 1, {}, "unknown", "__proto__"]]) {
+    assert.deepEqual(parseStatuslineOrder(value), fieldIds);
+  }
+  const partial = ["remote", "remote", null, "unknown", "provider", 0];
+  assert.deepEqual(parseStatuslineOrder(partial), fieldsFirst("remote", "provider"));
+  assert.deepEqual(partial, ["remote", "remote", null, "unknown", "provider", 0], "Parsing does not mutate the input");
+  assert.deepEqual(parseStatuslineOrder(fieldIds.toReversed()), fieldIds.toReversed());
+  assert.deepEqual(parseStatuslineSettings({ order: ["remote"], remote: false }), { ...fieldSettings(true), remote: false });
 });
 
 // The Claude reader never submits a prompt, spawns only once, and owns its cleanup.
@@ -888,16 +907,23 @@ test("checkbox menu rolls back failed saves and remains usable", async t => {
   assert.equal((await readSettings()).statusline["model-with-thinking"], false);
 });
 
-test("branch changes and shutdown close the menu and finish accepted saves", async t => {
-  for (const event of ["session_tree", "session_shutdown"]) {
+test("branch changes, reload, and shutdown close the menu and finish accepted toggles and moves", async t => {
+  for (const event of ["session_tree", "session_start", "session_shutdown"]) {
     await writeSettings({});
     const f = await fixture(t, "unsupported");
     const opened = f.command("");
     f.menu.handleInput(" ");
+    f.menu.handleInput("d"); f.menu.handleInput("d");
     await f.emit(event); await opened;
     assert.equal(f.menu, undefined);
-    assert.equal((await readSettings()).statusline["model-with-thinking"], false);
+    const expected = fieldsFirst("provider", "git-branch", "model-with-thinking");
+    assert.deepEqual((await readSettings()).statusline, { "model-with-thinking": false, order: expected });
     if (event === "session_shutdown") assert.deepEqual(f.raw(500), []);
+    else {
+      assert.deepEqual(await reportedOrder(f), expected);
+      assert.doesNotMatch(f.render(), /test-unsupported/);
+      assert.deepEqual(f.render().split(" · ").slice(0, 2), ["unsupported", "main"]);
+    }
   }
 });
 
@@ -916,6 +942,211 @@ test("checkbox menu supports mouse input and narrow widths without hiding its ch
   assert.doesNotMatch(f.render(), /remote/);
   f.menu.handleInput("\x1b"); await opened;
   assert.deepEqual((await readSettings()).statusline, { remote: false });
+});
+
+test("saved order is shared by the menu, status, and footer, and hidden fields keep their position across reload", async t => {
+  const saved = { fast: true, future: { keep: true }, statusline: { order: ["remote", "provider", "git-branch"], provider: false, future: "keep" } };
+  await writeSettings(saved);
+  const f = await fixture(t, "unsupported");
+  const expected = fieldsFirst("remote", "provider", "git-branch");
+  assert.deepEqual(await reportedOrder(f), expected);
+  assert.deepEqual(f.render().split(" · ").slice(0, 3), ["remote worker", "main", "test-unsupported"]);
+  const opened = f.command("");
+  assert.deepEqual(menuFields(f), expected);
+  assert.match(f.renderMenu(), /provider\s+\[ \]/);
+  f.menu.handleInput("\x1b"); await opened;
+  assert.deepEqual(await readSettings(), saved, "Reading a partial order does not rewrite it");
+  await f.command("provider on");
+  assert.deepEqual(f.render().split(" · ").slice(0, 4), ["remote worker", "unsupported", "main", "test-unsupported"]);
+  await f.command("provider off");
+  await f.emit("session_start");
+  assert.deepEqual(await reportedOrder(f), expected);
+  assert.deepEqual(f.render().split(" · ").slice(0, 3), ["remote worker", "main", "test-unsupported"]);
+  await f.command("provider on");
+  assert.deepEqual(f.render().split(" · ").slice(0, 3), ["remote worker", "unsupported", "main"]);
+  assert.deepEqual(await readSettings(), { ...saved, statusline: { ...saved.statusline, provider: true } });
+});
+
+test("u/d move the selected field immediately and rapid moves and toggles save in order before closing", async t => {
+  const f = await fixture(t, "unsupported");
+  const opened = f.command("");
+  assert.match(f.renderMenu(), /u up · d down/);
+  f.menu.handleInput("\x1b[B"); // Select provider.
+  f.menu.handleInput("u");
+  assert.deepEqual(menuFields(f), fieldsFirst("provider"));
+  assert.equal(selectedMenuField(f), "provider");
+  f.menu.handleInput("d"); f.menu.handleInput("d");
+  assert.deepEqual(menuFields(f), fieldsFirst("model-with-thinking", "git-branch", "provider"));
+  assert.equal(selectedMenuField(f), "provider");
+  f.menu.handleInput(" "); // Hide provider at its new position.
+  f.menu.handleInput("\x1b[B"); // Select remote.
+  f.menu.handleInput("d"); f.menu.handleInput("\r");
+  assert.equal(selectedMenuField(f), "remote");
+  const expected = fieldsFirst("model-with-thinking", "git-branch", "provider", "context-used-percentage", "remote");
+  assert.deepEqual(menuFields(f), expected);
+  f.menu.handleInput("\x1b"); await opened;
+  assert.deepEqual((await readSettings()).statusline, { order: expected, provider: false, remote: false });
+  assert.deepEqual(await reportedOrder(f), expected);
+  assert.deepEqual(f.render().split(" · ").slice(0, 3), ["test-unsupported", "main", "8% context used"]);
+  await f.emit("session_start");
+  assert.deepEqual(await reportedOrder(f), expected);
+});
+
+test("moving beyond either end does nothing and navigation alone never saves an order", async t => {
+  const f = await fixture(t, "unsupported");
+  const opened = f.command("");
+  f.menu.handleInput("u");
+  f.menu.handleInput("\x1b[A"); // Selection wraps; reordering must not wrap.
+  assert.equal(selectedMenuField(f), "output-speed-avg5");
+  f.menu.handleInput("d");
+  f.menu.handleInput("\x15"); f.menu.handleInput("\x04"); // Ctrl+u / Ctrl+d are not plain u/d.
+  assert.deepEqual(menuFields(f), fieldIds);
+  assert.doesNotMatch(f.renderMenu(), /Saving/);
+  f.menu.handleInput("\x1b"); await opened;
+  await f.command("move model-with-thinking up");
+  await f.command("move output-speed-avg5 down");
+  assert.deepEqual(await readSettings(), {});
+});
+
+test("failed move saves roll back to the last saved order without losing selection or checkbox state", async t => {
+  const f = await fixture(t, "unsupported");
+  await f.command("move git-branch up");
+  const saved = await readSettings();
+  const original = fieldsFirst("model-with-thinking", "git-branch", "provider");
+  await writeFile(settingsPath, "{broken");
+  const opened = f.command("");
+  f.menu.handleInput("d"); f.menu.handleInput("d"); f.menu.handleInput(" ");
+  await eventually(() => f.notifications.filter(item => item.level === "error").length === 3 && !f.renderMenu().includes("Saving…"));
+  assert.deepEqual(menuFields(f), original);
+  assert.equal(selectedMenuField(f), "model-with-thinking");
+  assert.match(f.renderMenu(), /model-with-thinking\s+\[X\]/);
+  assert.match(f.render(), /^test-unsupported · main · unsupported/);
+  assert.equal(await readFile(settingsPath, "utf8"), "{broken");
+  await writeSettings(saved);
+  f.menu.handleInput("d"); f.menu.handleInput("\r");
+  f.menu.handleInput("\x1b"); await opened;
+  assert.deepEqual((await readSettings()).statusline, { order: fieldsFirst("git-branch", "model-with-thinking", "provider"), "model-with-thinking": false });
+  assert.deepEqual(f.render().split(" · ").slice(0, 2), ["main", "unsupported"]);
+});
+
+test("reordering follows mouse selection in a scrolled list and survives resizing and narrow widths", async t => {
+  const f = await fixture(t, "unsupported");
+  f.terminal.rows = 8;
+  const opened = f.command("");
+  for (let i = 0; i < 6; i++) f.menu.handleInput("\x1b[B");
+  assert.equal(selectedMenuField(f), "context-used-tokens");
+  assert.ok(f.menu.render(80).length <= f.terminal.rows);
+  // Press selects the first visible row. It stays selected even if the viewport recenters before click.
+  f.menu.handleMouse({ type: "press", button: "left", x: 3, y: 2 });
+  assert.equal(selectedMenuField(f), "quota-reset");
+  f.menu.handleMouse({ type: "click", button: "left", x: 3, y: 2 });
+  f.menu.handleInput("d");
+  assert.equal(selectedMenuField(f), "quota-reset");
+  f.terminal.rows = 24;
+  const expected = [...fieldIds];
+  [expected[5], expected[6]] = [expected[6], expected[5]];
+  assert.deepEqual(menuFields(f), expected);
+  assert.equal(selectedMenuField(f), "quota-reset");
+  for (const width of [1, 10, 24, 40, 80]) {
+    for (const line of f.menu.render(width)) assert.ok(visibleWidth(line) <= width);
+    if (width >= 10) assert.equal(f.renderMenu(width).match(/\[[X ]\]/g)?.length, fieldIds.length);
+  }
+  f.menu.handleInput("\x1b"); await opened;
+  assert.deepEqual((await readSettings()).statusline, { "quota-reset": false, order: expected });
+});
+
+test("finishing a move save between mouse press and click preserves the pressed field", async t => {
+  const f = await fixture(t, "unsupported");
+  f.terminal.rows = 8;
+  const opened = f.command("");
+  for (let i = 0; i < 6; i++) f.menu.handleInput("\x1b[B");
+  f.menu.handleInput("d"); // Move context-used-tokens below context-window-tokens.
+  f.menu.handleMouse({ type: "press", button: "left", x: 3, y: 2 });
+  assert.equal(selectedMenuField(f), "context-window-tokens");
+  await eventually(() => !f.renderMenu().includes("Saving…"));
+  f.menu.handleMouse({ type: "click", button: "left", x: 3, y: 2 });
+  assert.equal(selectedMenuField(f), "context-window-tokens");
+  f.menu.handleInput("\x1b"); await opened;
+  assert.equal((await readSettings()).statusline["context-window-tokens"], false);
+  assert.equal((await readSettings()).statusline["quota-reset"], undefined);
+});
+
+test("concurrent move commands accumulate, reset changes only order, and invalid commands never write", async t => {
+  await writeSettings({ fast: true, future: { keep: true }, statusline: { "quota-reset": false, future: "keep" } });
+  const f = await fixture(t, "openai-codex");
+  await Promise.all([f.command("move provider down"), f.command("move provider down"), f.command("remote off"),
+    f.commands.get("fast").handler("off", f.ctx)]);
+  const expected = fieldsFirst("model-with-thinking", "git-branch", "remote", "provider");
+  const saved = { fast: false, future: { keep: true }, statusline: { "quota-reset": false, future: "keep", remote: false, order: expected } };
+  assert.deepEqual(await readSettings(), saved);
+  assert.deepEqual(await reportedOrder(f), expected);
+  await f.command("reset-order");
+  assert.deepEqual(await readSettings(), { ...saved, statusline: { ...saved.statusline, order: fieldIds } });
+  assert.deepEqual(await reportedOrder(f), fieldIds);
+  const before = await readFile(settingsPath, "utf8");
+  for (const args of ["move", "move provider", "move provider sideways", "move unknown up", "move provider up extra", "reset-order extra"]) {
+    await f.command(args);
+    assert.equal(f.notifications.at(-1).level, "warning", args);
+    assert.equal(await readFile(settingsPath, "utf8"), before);
+  }
+  const command = f.commands.get("statusline");
+  assert.deepEqual(command.getArgumentCompletions("move provider ").map(item => item.value), ["move provider up", "move provider down"]);
+  assert.deepEqual(command.getArgumentCompletions("reset-").map(item => item.value), ["reset-order"]);
+  for (const contents of ["{broken", "null", "[]"]) {
+    await writeFile(settingsPath, contents);
+    for (const args of ["move provider up", "reset-order"]) {
+      await f.command(args);
+      assert.equal(f.notifications.at(-1).level, "error");
+      assert.equal(await readFile(settingsPath, "utf8"), contents);
+      assert.deepEqual(await reportedOrder(f), fieldIds);
+    }
+  }
+  assert.deepEqual(f.authCalls, []);
+});
+
+test("custom order keeps quotas together in full and compact layouts and omits unsupported fields cleanly", async t => {
+  await writeSettings({ statusline: { ...fieldSettings(false), "context-used-percentage": true, "quota-reset": true,
+    order: ["context-used-percentage", "quota-reset"] } });
+  t.mock.method(globalThis, "fetch", async () => Response.json({ rate_limit: {
+    primary_window: { used_percent: 30, limit_window_seconds: 18000, reset_after_seconds: 7200 },
+    secondary_window: { used_percent: 50, limit_window_seconds: 604800, reset_after_seconds: 259200 },
+  } }));
+  const f = await fixture(t, "openai-codex");
+  await eventually(() => f.render().includes("5h 70%"));
+  assert.equal(f.render(), "8% context used · 5h 70% left 2h · weekly 50% left 3d");
+  for (const label of ["week", "wk"]) {
+    const text = `ctx 8% · 5h 70% 2h · ${label} 50% 3d`;
+    assert.equal(f.render(visibleWidth(text)), text);
+  }
+  await f.command("move quota-reset up");
+  assert.equal(f.render(), "5h 70% left 2h · weekly 50% left 3d · 8% context used");
+  for (const mode of ["truecolor", "256color"]) {
+    f.theme.getColorMode = () => mode;
+    for (const width of [1, 10, 24, 40, 80]) for (const line of f.raw(width)) assert.ok(visibleWidth(line) <= width);
+  }
+  await f.switch("unsupported");
+  assert.equal(f.render(), "8% context used");
+  await f.command("context-used-percentage off");
+  assert.deepEqual(f.raw(500), []);
+});
+
+test("moving fields never restarts quota polling, changes fast mode, or resets response speeds", async t => {
+  await writeSettings({ fast: true });
+  const requests = t.mock.method(globalThis, "fetch", async () => Response.json({ rate_limit: {
+    primary_window: { used_percent: 30, limit_window_seconds: 18000, reset_after_seconds: 7200 },
+  } }));
+  const f = await fixture(t, "openai-codex");
+  await eventually(() => f.render().includes("5h 70%"));
+  const clock = speedClock(t, f);
+  await clock.complete(20, 1000);
+  await f.command("move quota-reset up");
+  await f.command("move output-speed up");
+  assert.match(f.render(), /last 20\.0 tok\/s · 128K window · avg5 20\.0 tok\/s$/);
+  await f.command("reset-order");
+  assertSpeeds(f, 20);
+  assert.match(f.render(), /test-openai-codex fast/);
+  assert.equal((await readSettings()).fast, true);
+  assert.equal(requests.mock.callCount(), 1);
 });
 
 test("each of the ten fields can be the only visible field, and all-off leaves no footer", async t => {
@@ -1064,6 +1295,12 @@ test("non-TUI sessions never fetch usage, but direct statusline commands still s
     assert.equal((await readSettings()).statusline["quota-reset"], false);
     await f.command(""); assert.equal(f.notifications.at(-1).level, "warning");
     assert.equal(f.menu, undefined);
+    await f.command("move provider up");
+    assert.deepEqual((await readSettings()).statusline.order, fieldsFirst("provider"));
+    assert.deepEqual(await reportedOrder(f), fieldsFirst("provider"));
+    await f.command("reset-order");
+    assert.deepEqual((await readSettings()).statusline.order, fieldIds);
+    assert.deepEqual(f.authCalls, []);
   }
 });
 
