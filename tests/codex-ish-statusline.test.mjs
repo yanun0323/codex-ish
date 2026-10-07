@@ -57,7 +57,7 @@ const { ClaudeUsageReader, CLAUDE_USAGE_METHOD } = await jiti.import(resolve(her
 const { visibleWidth, getKeybindings } = await import(join(piRoot, "node_modules/@earendil-works/pi-tui/dist/index.js"));
 const { initTheme } = await import(join(piRoot, "dist/modes/interactive/theme/theme.js"));
 initTheme("dark", false);
-const fieldIds = ["model-with-thinking", "provider", "remote", "context-used-percentage", "quota-reset", "context-used-tokens", "context-window-tokens"];
+const fieldIds = ["model-with-thinking", "provider", "remote", "context-used-percentage", "quota-reset", "context-used-tokens", "context-window-tokens", "output-speed", "output-speed-avg5"];
 const fieldSettings = enabled => Object.fromEntries(fieldIds.map(id => [id, enabled]));
 const settingsPath = join(agentDir, "codex-ish.json");
 const writeSettings = settings => writeFile(settingsPath, JSON.stringify(settings));
@@ -149,6 +149,37 @@ async function fixture(t, provider = "deepseek", mode = "tui") {
   };
 }
 
+function speedClock(t, f) {
+  let timestamp = 0;
+  const clock = {
+    now: 0,
+    message(output, extra = {}) {
+      return { role: "assistant", api: f.ctx.model.api, provider: f.ctx.model.provider, model: f.ctx.model.id,
+        timestamp: ++timestamp, content: [{ type: "text", text: "reply" }], stopReason: "stop",
+        usage: { input: 1000, output, cacheRead: 100, cacheWrite: 0, totalTokens: 1100 + output,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, ...extra };
+    },
+    async start(message) {
+      await f.emit("turn_start");
+      await f.emit("message_start", { message: { ...message, stopReason: "pending", usage: { ...message.usage, output: 0 } } });
+    },
+    async complete(output, milliseconds, extra = {}) {
+      const message = clock.message(output, extra);
+      await clock.start(message);
+      clock.now += milliseconds;
+      await f.emit("message_end", { message });
+      await f.emit("turn_end");
+      return message;
+    },
+  };
+  t.mock.method(performance, "now", () => clock.now);
+  return clock;
+}
+function assertSpeeds(f, last, average = last) {
+  const value = speed => speed === undefined ? "—" : speed.toFixed(1);
+  assert.deepEqual(f.render().split(" · ").slice(-2), [`last ${value(last)} tok/s`, `avg5 ${value(average)} tok/s`]);
+}
+
 // Payload and HTTP contracts.
 test("DeepSeek picks USD total balance, including zero and debt, without converting CNY", () => {
   assert.equal(parseDeepSeekBalance({ balance_infos: [{ currency: "CNY", total_balance: "99.00" }, ...balancePayload("12.345").balance_infos] }), 12.345);
@@ -236,7 +267,7 @@ test("Claude usage converts documented percentages (not fractions) and ISO reset
     { weekly: { remaining: 0, resetAt: undefined } });
 });
 
-test("seven field switches default to on, use explicit false, and ignore old provider switches", () => {
+test("nine field switches default to on, use explicit false, and ignore old provider switches", () => {
   const defaults = fieldSettings(true);
   for (const value of [undefined, null, [], { fast: true }, { provider: "false", remote: 0 },
     { codex: false, antigravity: false, deepseek: false, "claude-bridge": false }]) {
@@ -355,6 +386,182 @@ test("Codex and Antigravity still show model-specific quotas and keep compact re
   assert.equal(requests.length, 3);
 });
 
+test("completed response speeds include initial wait and thinking, exclude tools and idle time, and follow context-window", async t => {
+  const f = await fixture(t, "unsupported");
+  const clock = speedClock(t, f);
+  assertSpeeds(f);
+  assert.match(f.render(), /128K window · last — tok\/s · avg5 — tok\/s$/);
+  clock.now += 60_000;
+  await f.emit("turn_start");
+  const user = { role: "user", content: "question", timestamp: 0 };
+  await f.emit("message_start", { message: user });
+  await f.emit("message_end", { message: user });
+  // A provider can emit its assistant start only after network setup and initial waiting.
+  clock.now += 9000;
+  const message = clock.message(100);
+  message.usage.reasoning = 60;
+  await f.emit("message_start", { message });
+  await f.emit("message_update", { message, assistantMessageEvent: { type: "thinking_delta", delta: "thinking", contentIndex: 0 } });
+  clock.now += 1000;
+  assertSpeeds(f);
+  const redraws = f.redraws;
+  await f.emit("message_end", { message });
+  assertSpeeds(f, 10);
+  assert.ok(f.redraws > redraws, "Completion redraws the footer immediately");
+  clock.now += 90_000;
+  const tool = { role: "toolResult", toolCallId: "call", toolName: "read", content: [], isError: false, timestamp: 0,
+    usage: { output: 999999 } };
+  await f.emit("message_start", { message: tool });
+  await f.emit("message_end", { message: tool });
+  await f.emit("turn_end");
+  assertSpeeds(f, 10);
+  clock.now += 120_000;
+  await clock.complete(100, 1000);
+  assertSpeeds(f, 100, 55); // Arithmetic mean, not 200 tokens / 11 seconds.
+  await f.emit("message_end", { message });
+  assertSpeeds(f, 100, 55);
+  assert.deepEqual(f.authCalls, [], "Measuring speeds never queries the provider");
+});
+
+test("avg5 retains only five valid responses and averages unrounded rates", async t => {
+  const f = await fixture(t, "unsupported");
+  const clock = speedClock(t, f);
+  for (let i = 1; i <= 6; i++) {
+    await clock.complete(i * 100, 10_000, { stopReason: i === 2 ? "toolUse" : i === 3 ? "length" : "stop" });
+    assertSpeeds(f, i * 10, i <= 5 ? (i + 1) * 5 : 40);
+  }
+  await f.emit("session_tree");
+  await clock.complete(4, 100_000);
+  await clock.complete(4, 100_000);
+  await clock.complete(9, 100_000);
+  assertSpeeds(f, 0.1, 0.1); // (.04 + .04 + .09) / 3, not (0.0 + 0.0 + 0.1) / 3.
+});
+
+test("speeds ignore unsuccessful responses, missing or invalid usage, and invalid durations", async t => {
+  const f = await fixture(t, "unsupported");
+  const clock = speedClock(t, f);
+  await clock.complete(10, 1000);
+  for (const stopReason of ["error", "aborted", "pending", "deferred"]) {
+    await clock.complete(900, 1000, { stopReason });
+    assertSpeeds(f, 10);
+  }
+  for (const output of [undefined, null, 0, -1, 1.5, "100", NaN, Infinity, Number.MAX_VALUE]) {
+    await clock.complete(output, 1000);
+    assertSpeeds(f, 10);
+  }
+  await clock.complete(900, 1000, { usage: undefined });
+  assertSpeeds(f, 10);
+  for (const duration of [0, -1000, NaN, Infinity]) {
+    clock.now = 10_000;
+    await clock.complete(900, duration);
+    assertSpeeds(f, 10);
+  }
+  clock.now = 10_000;
+  const next = clock.message(20);
+  await clock.start(next);
+  for (const different of [{ timestamp: next.timestamp - 1 }, { model: "other" }, { provider: "other" }]) {
+    await f.emit("message_end", { message: { ...next, ...different } });
+    assertSpeeds(f, 10);
+  }
+  clock.now += 1000;
+  await f.emit("message_end", { message: next });
+  assertSpeeds(f, 20, 15);
+  await f.emit("message_end", { message: next });
+  assertSpeeds(f, 20, 15);
+});
+
+test("model changes reset both speeds and discard late completions without losing the new request", async t => {
+  const f = await fixture(t, "unsupported");
+  const clock = speedClock(t, f);
+  await clock.complete(10, 1000);
+  const old = clock.message(900);
+  await clock.start(old);
+  await f.switch("another", old.model); // Same model ID, different provider.
+  assertSpeeds(f);
+  const current = clock.message(20);
+  await clock.start(current);
+  clock.now += 1000;
+  await f.emit("message_end", { message: old });
+  assertSpeeds(f);
+  await f.emit("message_end", { message: current });
+  assertSpeeds(f, 20);
+  await f.switch("another", current.model); // Reselecting the same model is not a change.
+  assertSpeeds(f, 20);
+  await f.switch("another", "different-model");
+  assertSpeeds(f);
+});
+
+test("branch and session changes clear speed history; ended turns cannot publish late results", async t => {
+  const f = await fixture(t, "unsupported");
+  const clock = speedClock(t, f);
+  for (const event of ["session_tree", "session_start", "session_shutdown"]) {
+    await clock.complete(10, 1000);
+    const old = clock.message(900);
+    await clock.start(old);
+    await f.emit(event);
+    if (event === "session_shutdown") await f.emit("session_start");
+    assertSpeeds(f);
+    const current = clock.message(20);
+    await clock.start(current);
+    clock.now += 1000;
+    await f.emit("message_end", { message: old });
+    assertSpeeds(f);
+    await f.emit("message_end", { message: current });
+    assertSpeeds(f, 20);
+  }
+  for (const event of ["turn_end", "agent_end"]) {
+    const unfinished = clock.message(900);
+    await clock.start(unfinished);
+    await f.emit(event);
+    clock.now += 1000;
+    await f.emit("message_end", { message: unfinished });
+    assertSpeeds(f, 20);
+  }
+  await f.emit("session_shutdown");
+  await clock.complete(900, 1000);
+  await f.emit("session_start");
+  assertSpeeds(f);
+  assert.deepEqual(await readSettings(), {}, "Request timing and history stay in memory");
+});
+
+test("speed fields have independent persistent switches and keep measuring while hidden", async t => {
+  await writeSettings({ statusline: fieldSettings(false) });
+  const f = await fixture(t, "unsupported");
+  const clock = speedClock(t, f);
+  await clock.complete(10, 1000);
+  await clock.complete(20, 1000);
+  assert.deepEqual(f.raw(500), []);
+  await f.command("output-speed on");
+  assert.equal(f.render(), "last 20.0 tok/s");
+  await f.command("output-speed-avg5 on");
+  assertSpeeds(f, 20, 15);
+  await f.command("output-speed off");
+  await clock.complete(40, 1000);
+  assert.equal(f.render(), "avg5 23.3 tok/s");
+  await f.command("output-speed on");
+  await f.command("output-speed-avg5 off");
+  await clock.complete(50, 1000);
+  assert.equal(f.render(), "last 50.0 tok/s");
+  await f.command("output-speed-avg5 on");
+  await f.command("context-window-tokens on");
+  assert.equal(f.render(), "128K window · last 50.0 tok/s · avg5 30.0 tok/s");
+  for (const mode of ["truecolor", "256color"]) {
+    f.theme.getColorMode = () => mode;
+    for (const width of [1, 10, 24, 40, 80]) {
+      for (const line of f.raw(width)) assert.ok(visibleWidth(line) <= width);
+    }
+  }
+  await f.command("output-speed off");
+  await f.emit("session_shutdown");
+  await f.emit("session_start");
+  assert.equal(f.render(), "128K window · avg5 — tok/s");
+  assert.deepEqual((await readSettings()).statusline,
+    { ...fieldSettings(false), "context-window-tokens": true, "output-speed-avg5": true });
+  for (const id of ["output-speed", "output-speed-avg5"]) {
+    assert.deepEqual(f.commands.get("statusline").getArgumentCompletions(`${id} `).map(item => item.value), [`${id} on`, `${id} off`]);
+  }
+});
+
 test("field switches persist across reload, preserve /fast, and replace obsolete provider switches", async t => {
   await writeSettings({ fast: true, future: { keep: true }, statusline: { future: "keep", deepseek: false, "claude-bridge": false } });
   t.mock.method(globalThis, "fetch", async () => Response.json(balancePayload("1")));
@@ -378,11 +585,11 @@ test("field switches persist across reload, preserve /fast, and replace obsolete
   assert.equal((await readdir(agentDir)).some(name => name.endsWith(".tmp")), false);
 });
 
-test("/statusline is a seven-field checkbox menu with aligned values and keyboard toggles", async t => {
+test("/statusline is a nine-field checkbox menu with aligned values and keyboard toggles", async t => {
   const f = await fixture(t, "unsupported");
   const opened = f.command("");
   const lines = f.renderMenu().split("\n").filter(line => line.includes("[X]"));
-  assert.equal(lines.length, 7);
+  assert.equal(lines.length, fieldIds.length);
   for (const [index, id] of fieldIds.entries()) assert.ok(lines[index].includes(id));
   assert.equal(new Set(lines.map(line => line.indexOf("[X]"))).size, 1, "Checkboxes align");
   assert.doesNotMatch(f.renderMenu(), /Codex quota|Antigravity|DeepSeek|Claude Bridge/);
@@ -397,7 +604,7 @@ test("/statusline is a seven-field checkbox menu with aligned values and keyboar
   assert.deepEqual((await readSettings()).statusline, fieldSettings(false));
   assert.deepEqual(f.raw(500), []);
   await f.command("status");
-  assert.equal(f.notifications.at(-1).message.match(/\[ \]/g).length, 7);
+  assert.equal(f.notifications.at(-1).message.match(/\[ \]/g).length, fieldIds.length);
   const before = await readFile(settingsPath, "utf8");
   const cancelled = f.command(""); f.menu.handleInput("\x03"); await cancelled;
   assert.equal(await readFile(settingsPath, "utf8"), before);
@@ -452,7 +659,7 @@ test("checkbox menu supports mouse input and narrow widths without hiding its ch
   for (const width of [1, 10, 24, 40, 80]) {
     const lines = f.menu.render(width);
     for (const line of lines) assert.ok(visibleWidth(line) <= width);
-    if (width >= 10) assert.equal(stripVTControlCharacters(lines.join("\n")).match(/\[X\]/g)?.length, 7);
+    if (width >= 10) assert.equal(stripVTControlCharacters(lines.join("\n")).match(/\[X\]/g)?.length, fieldIds.length);
   }
   f.menu.handleMouse({ type: "press", button: "left", x: 3, y: 4 });
   f.menu.handleMouse({ type: "click", button: "left", x: 3, y: 4 });
@@ -462,12 +669,12 @@ test("checkbox menu supports mouse input and narrow widths without hiding its ch
   assert.deepEqual((await readSettings()).statusline, { remote: false });
 });
 
-test("each of the seven fields can be the only visible field, and all-off leaves no footer", async t => {
+test("each of the nine fields can be the only visible field, and all-off leaves no footer", async t => {
   await writeSettings({ statusline: fieldSettings(false) });
   const requests = t.mock.method(globalThis, "fetch", async () => Response.json(balancePayload("12.34")));
   const f = await fixture(t);
   f.ctx.model.id = "model-fixture"; f.ctx.thinkingLevel = "high";
-  const expected = ["model-fixture high", "deepseek", "remote worker", "8% context used", "USD 12.34 left", "10K used", "128K window"];
+  const expected = ["model-fixture high", "deepseek", "remote worker", "8% context used", "USD 12.34 left", "10K used", "128K window", "last — tok/s", "avg5 — tok/s"];
   assert.deepEqual(f.raw(500), []); assert.equal(requests.mock.callCount(), 0);
   for (const [index, id] of fieldIds.entries()) {
     await f.command(`${id} on`);
@@ -496,7 +703,8 @@ test("hiding individual fields neither changes fast mode nor restarts quota poll
   assert.match(f.render(), /test-openai-codex high fast/);
   const full = f.render().split(" · ");
   for (const [id, text] of [["model-with-thinking", full[0]], ["provider", full[1]], ["remote", full[2]],
-    ["context-used-percentage", full[3]], ["context-used-tokens", full.at(-2)], ["context-window-tokens", full.at(-1)]]) {
+    ["context-used-percentage", full[3]], ["context-used-tokens", full.at(-4)], ["context-window-tokens", full.at(-3)],
+    ["output-speed", full.at(-2)], ["output-speed-avg5", full.at(-1)]]) {
     await f.command(`${id} off`);
     assert.deepEqual(f.render().split(" · "), full.filter(part => part !== text));
     await f.command(`${id} on`);

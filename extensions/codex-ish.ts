@@ -304,6 +304,8 @@ const STATUSLINE_ITEMS = [
   "quota-reset",
   "context-used-tokens",
   "context-window-tokens",
+  "output-speed",
+  "output-speed-avg5",
 ] as const;
 type StatuslineSource = typeof STATUSLINE_SOURCES[number]["id"];
 type StatuslineItem = typeof STATUSLINE_ITEMS[number];
@@ -1810,6 +1812,31 @@ export default function codexIsh(pi: ExtensionAPI) {
   let stopped = true;
   let requestRender: (() => void) | undefined;
   let previousEditorFactory: EditorFactory | undefined;
+  const outputSpeedSamples: number[] = [];
+  let outputSpeedTurn: {
+    startedAt: number;
+    message?: Pick<AssistantMessage, "provider" | "model" | "timestamp">;
+  } | undefined;
+  const resetOutputSpeeds = () => {
+    outputSpeedTurn = undefined;
+    outputSpeedSamples.length = 0;
+  };
+  const recordOutputSpeed = (message: AssistantMessage) => {
+    const turn = outputSpeedTurn;
+    if (!turn?.message || message.provider !== turn.message.provider ||
+        message.model !== turn.message.model || message.timestamp !== turn.message.timestamp) return;
+    // Consume each request once, including failures, without timing its subsequent tools.
+    outputSpeedTurn = undefined;
+    const elapsedMs = performance.now() - turn.startedAt;
+    const tokens = message.usage?.output;
+    if (!["stop", "length", "toolUse"].includes(message.stopReason) ||
+        typeof tokens !== "number" || !Number.isSafeInteger(tokens) || tokens <= 0 ||
+        !Number.isFinite(elapsedMs) || elapsedMs <= 0) return;
+    const speed = tokens / (elapsedMs / 1000);
+    if (!Number.isFinite(speed)) return;
+    outputSpeedSamples.push(speed);
+    if (outputSpeedSamples.length > 5) outputSpeedSamples.shift();
+  };
   const skillBlockCache = new Map<string, Promise<string | undefined>>();
   const reportedSkillErrors = new Set<string>();
   const stopRefresh = () => {
@@ -1929,12 +1956,30 @@ export default function codexIsh(pi: ExtensionAPI) {
   });
 
   const redraw = () => requestRender?.();
-  pi.on("model_select", (_event, ctx) => restartRefresh(ctx));
+  pi.on("model_select", (event, ctx) => {
+    if (event.model.provider !== event.previousModel?.provider || event.model.id !== event.previousModel?.id) {
+      resetOutputSpeeds();
+    }
+    restartRefresh(ctx);
+  });
   pi.on("thinking_level_select", redraw);
-  pi.on("message_end", redraw);
-  pi.on("turn_end", redraw);
+  pi.on("turn_start", (_event, ctx) => {
+    // Assistant message_start may arrive after network setup; start here to include that wait.
+    outputSpeedTurn = !stopped && ctx.mode === "tui" ? { startedAt: performance.now() } : undefined;
+  });
+  pi.on("message_start", ({ message }) => {
+    if (!outputSpeedTurn || outputSpeedTurn.message || message.role !== "assistant") return;
+    const { provider, model, timestamp } = message;
+    outputSpeedTurn.message = { provider, model, timestamp };
+  });
+  pi.on("message_end", ({ message }) => {
+    if (message.role === "assistant") recordOutputSpeed(message);
+    redraw();
+  });
+  pi.on("turn_end", () => { outputSpeedTurn = undefined; redraw(); });
+  pi.on("agent_end", () => { outputSpeedTurn = undefined; });
   pi.on("session_compact", redraw);
-  pi.on("session_tree", redraw);
+  pi.on("session_tree", () => { resetOutputSpeeds(); redraw(); });
 
   let closeSide: (() => void) | undefined;
   pi.on("session_tree", () => { closeSide?.(); closeStatusline?.(); });
@@ -2322,6 +2367,7 @@ export default function codexIsh(pi: ExtensionAPI) {
     closeStatusline?.();
     stopped = false;
     clearTimers();
+    resetOutputSpeeds();
     quotaState = { kind: "loading" };
     const settings = await readSettings().catch(() => ({} as Record<string, unknown>));
     if (stopped || session !== statuslineSession) return;
@@ -2386,6 +2432,15 @@ export default function codexIsh(pi: ExtensionAPI) {
             `${formatTokens(usage?.contextWindow ?? ctx.model?.contextWindow)} window`,
             CODEX_STATUS_COLORS.context,
           );
+          const speedText = (label: string, speed: number | undefined) => {
+            const text = `${label} ${speed === undefined ? "—" : speed.toFixed(1)} tok/s`;
+            return speed === undefined ? theme.fg("dim", text) : paint(text, CODEX_STATUS_COLORS.metadata);
+          };
+          const outputSpeed = speedText("last", outputSpeedSamples.at(-1));
+          // Average the unrounded per-response rates, not total tokens / total time.
+          const outputSpeedAverage = speedText("avg5", outputSpeedSamples.length
+            ? outputSpeedSamples.reduce((sum, speed) => sum + speed / outputSpeedSamples.length, 0)
+            : undefined);
           const contextPercent = usage?.percent === null || usage?.percent === undefined
             ? undefined
             : Math.round(usage.percent);
@@ -2424,6 +2479,8 @@ export default function codexIsh(pi: ExtensionAPI) {
               ["quota-reset", quotaParts(compact, weeklyLabel)],
               ["context-used-tokens", [contextUsedTokens]],
               ["context-window-tokens", [contextWindowTokens]],
+              ["output-speed", [outputSpeed]],
+              ["output-speed-avg5", [outputSpeedAverage]],
             ];
             return fields.flatMap(([id, parts]) => statuslineSettings[id] ? parts : []).join(separator);
           };
@@ -2447,6 +2504,7 @@ export default function codexIsh(pi: ExtensionAPI) {
     closeStatusline?.();
     stopped = true;
     clearTimers();
+    resetOutputSpeeds();
     requestRender = undefined;
     if (ctx.mode === "tui") {
       ctx.ui.setEditorComponent(previousEditorFactory);

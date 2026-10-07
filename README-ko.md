@@ -41,13 +41,14 @@ pi install git:github.com/yanun0323/codex-ish
 
 ### 상태줄 푸터
 
-모델, provider, 원격 제어 상태, 컨텍스트 사용량, 실시간 할당량을 표시하는 커스텀 푸터입니다.
+모델, provider, 원격 제어 상태, 컨텍스트 사용량, 실시간 할당량, 응답 속도를 표시하는 커스텀 푸터입니다.
 
 - **Codex**: 5시간 및 주간 남은 비율과 초기화 카운트다운 표시 (`gpt-5.3-codex-spark`는 별도 한도).
 - **Antigravity (Google)**: 모델 가족별 할당량 그룹.
 - **DeepSeek API**: 선택한 모델의 Pi 인증 정보로 USD 잔액을 표시합니다. 공식 `api.deepseek.com`만 지원하며 USD 잔액이 없으면 `n/a`로 표시합니다. 위안화를 임의로 환산하지 않습니다.
 - **Claude Bridge (`pi-claude-bridge`)**: bridge에 설치된 Claude Agent SDK와 Claude Code 로그인을 사용해 5시간 및 주간 남은 비율과 초기화 카운트다운을 표시합니다. 대기 중인 보조 프로세스는 사용량만 조회하며 모델 프롬프트를 보내거나 대화 기록을 훑지 않습니다. SDK 사용량 API는 실험 기능이므로 지원하지 않는 버전이나 로그인 방식에서는 `-`를 표시합니다. 필요하면 bridge를 업데이트하고 `/reload`를 실행하세요.
-- `/statusline`은 일곱 항목의 독립적인 체크박스를 열며 기본적으로 모두 켜져 있습니다: `model-with-thinking`, `provider`, `remote`, `context-used-percentage`, `quota-reset`, `context-used-tokens`, `context-window-tokens`. ↑/↓로 선택하고 Enter/Space로 전환하며 Esc로 닫습니다. 변경 사항은 바로 저장됩니다. `/statusline <field> on|off`로도 전환할 수 있으며 `/statusline status`로 설정을 확인합니다. 이전 버전의 provider별 스위치는 더 이상 적용되지 않습니다.
+- `/statusline`은 아홉 항목의 독립적인 체크박스를 열며 기본적으로 모두 켜져 있습니다: `model-with-thinking`, `provider`, `remote`, `context-used-percentage`, `quota-reset`, `context-used-tokens`, `context-window-tokens`, `output-speed`, `output-speed-avg5`. ↑/↓로 선택하고 Enter/Space로 전환하며 Esc로 닫습니다. 변경 사항은 바로 저장됩니다. `/statusline <field> on|off`로도 전환할 수 있으며 `/statusline status`로 설정을 확인합니다. 이전 버전의 provider별 스위치는 더 이상 적용되지 않습니다.
+- `output-speed`(`last 42.6 tok/s`)와 `output-speed-avg5`(`avg5 39.8 tok/s`)는 이 순서로 `context-window-tokens` 뒤에 표시되며 각각 독립적으로 표시를 켜고 끌 수 있습니다. 메인 대화의 모델 응답이 끝났을 때만 갱신하며, 보고된 출력 토큰 수(사고 토큰 포함)를 해당 모델 턴 시작부터 경과한 초로 나눠 계산합니다. 최초 대기 시간은 포함하지만 Pi 도구 실행 시간과 유휴 시간은 제외합니다. `avg5`는 최근 유효한 응답 5개의 속도를 더한 뒤 개수로 나눈 평균이며, 5개 미만이면 현재 개수를 사용합니다. 실패·취소된 응답이나 양수 출력 토큰 수가 보고되지 않은 응답은 제외하고, 표본이 없으면 `—`를 표시합니다. 어느 항목을 숨겨도 측정은 계속됩니다. 표본은 메모리에만 보관하며 모델·브랜치·세션을 바꾸거나 다시 불러오면 초기화됩니다.
 - `quota-reset`은 **현재 provider**의 잔액 또는 남은 비율과 초기화 카운트다운만 표시하며 60초마다 갱신합니다. 이 항목을 끄거나 모델을 바꾸거나 세션을 종료하면 조회를 취소하고 Claude 보조 프로세스를 종료합니다. 다른 체크박스는 해당 항목의 표시만 바꾸므로 `remote`를 숨겨도 Remote Control은 중지되지 않습니다. 간결한 표시에서도 초기화 카운트다운을 유지하며 색상은 truecolor 또는 ANSI-256 터미널에 자동으로 맞춰집니다.
 
 ### ChatGPT Remote Control (`/remote`)

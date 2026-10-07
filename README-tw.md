@@ -41,13 +41,14 @@ pi install git:github.com/yanun0323/codex-ish
 
 ### 狀態列 footer
 
-自訂 footer，顯示模型、provider、remote control 狀態、context 用量與即時額度：
+自訂 footer，顯示模型、provider、remote control 狀態、context 用量、即時額度與回覆速度：
 
 - **Codex**：5 小時與每週剩餘百分比，附重置倒數（`gpt-5.3-codex-spark` 有獨立額度）。
 - **Antigravity（Google）**：依模型家族分組的額度。
 - **DeepSeek API**：使用目前模型在 Pi 的憑證，顯示 USD 剩餘額度。只支援官方 `api.deepseek.com`；若沒有 USD 餘額，顯示 `n/a`，不會自行換算人民幣。
 - **Claude Bridge（`pi-claude-bridge`）**：透過 bridge 已安裝的 Claude Agent SDK 與 Claude Code 登入，顯示 5 小時與每週剩餘百分比、重置倒數。背景輔助程序只查額度，不發送模型提示，也不掃描對話紀錄。SDK 的額度介面仍屬實驗功能；版本或登入方式不支援時顯示 `-`，必要時請更新 bridge 並執行 `/reload`。
-- `/statusline` 會開啟七個獨立的欄位勾選項，預設皆開啟：`model-with-thinking`、`provider`、`remote`、`context-used-percentage`、`quota-reset`、`context-used-tokens`、`context-window-tokens`。用 ↑/↓ 選取、Enter/空白鍵切換、Esc 關閉；變更會立即儲存。也可執行 `/statusline <field> on|off`，或用 `/statusline status` 查看設定。舊版依 provider 分別開關的設定不再生效。
+- `/statusline` 會開啟九個獨立的欄位勾選項，預設皆開啟：`model-with-thinking`、`provider`、`remote`、`context-used-percentage`、`quota-reset`、`context-used-tokens`、`context-window-tokens`、`output-speed`、`output-speed-avg5`。用 ↑/↓ 選取、Enter/空白鍵切換、Esc 關閉；變更會立即儲存。也可執行 `/statusline <field> on|off`，或用 `/statusline status` 查看設定。舊版依 provider 分別開關的設定不再生效。
+- `output-speed`（`last 42.6 tok/s`）與 `output-speed-avg5`（`avg5 39.8 tok/s`）依序放在 `context-window-tokens` 後面，各有獨立的顯示開關。只在主對話的每次模型回覆完成後更新，以回報的輸出 token（包含思考）除以從該次模型回合開始計算的秒數。包含初始等待，不含 Pi 工具執行與閒置時間。`avg5` 是最近五次有效回覆速度相加後除以次數；不足五次就使用已有的次數。失敗、取消或未回報正數輸出 token 的回覆不納入；沒有樣本時顯示 `—`。隱藏任一欄位都不會停止計算。樣本只保留在記憶體，切換模型、分支、工作階段或重新載入時會清空。
 - `quota-reset` 只顯示**目前 provider** 的餘額或剩餘額度與重置倒數，每 60 秒更新。關閉此欄位、切換模型或結束工作階段時，會取消查詢並關閉 Claude 輔助程序。其他勾選項只影響欄位顯示；隱藏 `remote` 不會停止 Remote Control。精簡顯示仍保留重置倒數；顏色會自動適應 truecolor 或 ANSI-256 終端機。
 
 ### ChatGPT Remote Control（`/remote`）

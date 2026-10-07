@@ -41,13 +41,14 @@ Restart Pi after installing. Requirements:
 
 ### Statusline footer
 
-Custom footer with model, provider, remote-control state, context usage, and live quota:
+Custom footer with model, provider, remote-control state, context usage, live quota, and response speeds:
 
 - **Codex**: 5-hour and weekly remaining percentage with reset countdown (including a separate limit for `gpt-5.3-codex-spark`).
 - **Antigravity (Google)**: per-model-family quota groups.
 - **DeepSeek API**: remaining USD balance using the selected model's Pi credentials. Only the official `api.deepseek.com` endpoint is supported; missing USD balances show `n/a`, not a converted CNY amount.
 - **Claude Bridge (`pi-claude-bridge`)**: 5-hour and weekly remaining percentage with reset countdown, using the bridge's installed Claude Agent SDK and Claude Code login. An idle helper process reads usage without sending model prompts or scanning transcripts. The SDK usage API is experimental; unsupported versions/logins show `-`. Update the bridge and `/reload` if needed.
-- `/statusline` opens seven independent field checkboxes, all on by default: `model-with-thinking`, `provider`, `remote`, `context-used-percentage`, `quota-reset`, `context-used-tokens`, and `context-window-tokens`. Use ↑/↓ to select, Enter/Space to toggle, and Esc to close. Changes save immediately. `/statusline <field> on|off` also works; `/statusline status` lists the saved choices. The old per-provider switches no longer apply.
+- `/statusline` opens nine independent field checkboxes, all on by default: `model-with-thinking`, `provider`, `remote`, `context-used-percentage`, `quota-reset`, `context-used-tokens`, `context-window-tokens`, `output-speed`, and `output-speed-avg5`. Use ↑/↓ to select, Enter/Space to toggle, and Esc to close. Changes save immediately. `/statusline <field> on|off` also works; `/statusline status` lists the saved choices. The old per-provider switches no longer apply.
+- `output-speed` (`last 42.6 tok/s`) and `output-speed-avg5` (`avg5 39.8 tok/s`) appear after `context-window-tokens`, in that order, with separate display switches. They update only when a main-thread model response finishes, using reported output tokens (including thinking) divided by elapsed seconds from the model turn's start. Initial waiting is included; Pi tool execution and idle time are not. `avg5` is the arithmetic mean of the last five valid response rates, or all available rates if fewer than five exist. Failed/cancelled responses and responses without positive reported output tokens are skipped. With no valid samples, the fields show `—`. Hiding either field does not stop measurement. Samples stay in memory and reset on model, branch, or session changes and reloads.
 - `quota-reset` shows only the **current provider's** balance or remaining quota and reset countdown, refreshed every 60 seconds. Turning it off, switching models, or closing the session cancels queries and closes the Claude helper. Other checkboxes only hide their field; hiding `remote` does not stop Remote Control. Reset countdowns remain in compact layouts; colors adapt to truecolor or ANSI-256 terminals.
 
 ### ChatGPT Remote Control (`/remote`)
