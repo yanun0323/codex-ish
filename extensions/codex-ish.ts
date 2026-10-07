@@ -93,6 +93,8 @@ const ANTIGRAVITY_ENDPOINTS = [
 const REFRESH_MS = 60_000;
 const TICK_MS = 30_000;
 const TIMEOUT_MS = 10_000;
+// Short/buffered bursts cannot give a useful receive-side streaming speed.
+const OUTPUT_SPEED_MIN_STREAM_MS = 100;
 const CODEX_STATUS_COLORS = {
   model: [241, 223, 178],
   context: [231, 175, 137],
@@ -1825,7 +1827,9 @@ export default function codexIsh(pi: ExtensionAPI) {
   let previousEditorFactory: EditorFactory | undefined;
   const outputSpeedSamples: number[] = [];
   let outputSpeedTurn: {
-    startedAt: number;
+    firstOutputAt?: number;
+    lastOutputAt?: number;
+    sawThinking?: boolean;
     message?: Pick<AssistantMessage, "provider" | "model" | "timestamp">;
   } | undefined;
   const resetOutputSpeeds = () => {
@@ -1838,11 +1842,16 @@ export default function codexIsh(pi: ExtensionAPI) {
         message.model !== turn.message.model || message.timestamp !== turn.message.timestamp) return;
     // Consume each request once, including failures, without timing its subsequent tools.
     outputSpeedTurn = undefined;
-    const elapsedMs = performance.now() - turn.startedAt;
+    if (turn.firstOutputAt === undefined || turn.lastOutputAt === undefined) return;
+    const streamMs = turn.lastOutputAt - turn.firstOutputAt;
+    const elapsedMs = performance.now() - turn.firstOutputAt;
     const tokens = message.usage?.output;
     if (!["stop", "length", "toolUse"].includes(message.stopReason) ||
         typeof tokens !== "number" || !Number.isSafeInteger(tokens) || tokens <= 0 ||
-        !Number.isFinite(elapsedMs) || elapsedMs <= 0) return;
+        !Number.isFinite(streamMs) || streamMs < OUTPUT_SPEED_MIN_STREAM_MS ||
+        !Number.isFinite(elapsedMs) || elapsedMs < streamMs) return;
+    // Hidden thinking is included in output tokens, but its generation wasn't timed.
+    if ((message.usage.reasoning ?? 0) > 0 && !turn.sawThinking) return;
     const speed = tokens / (elapsedMs / 1000);
     if (!Number.isFinite(speed)) return;
     outputSpeedSamples.push(speed);
@@ -1975,13 +1984,24 @@ export default function codexIsh(pi: ExtensionAPI) {
   });
   pi.on("thinking_level_select", redraw);
   pi.on("turn_start", (_event, ctx) => {
-    // Assistant message_start may arrive after network setup; start here to include that wait.
-    outputSpeedTurn = !stopped && ctx.mode === "tui" ? { startedAt: performance.now() } : undefined;
+    outputSpeedTurn = !stopped && ctx.mode === "tui" ? {} : undefined;
   });
   pi.on("message_start", ({ message }) => {
     if (!outputSpeedTurn || outputSpeedTurn.message || message.role !== "assistant") return;
     const { provider, model, timestamp } = message;
     outputSpeedTurn.message = { provider, model, timestamp };
+  });
+  pi.on("message_update", ({ message, assistantMessageEvent: event }) => {
+    const turn = outputSpeedTurn;
+    if (message.role !== "assistant" || !turn?.message || message.provider !== turn.message.provider ||
+        message.model !== turn.message.model || message.timestamp !== turn.message.timestamp) return;
+    // Start events may contain only metadata; wait for actual streamed content.
+    if ((event.type !== "text_delta" && event.type !== "thinking_delta" && event.type !== "toolcall_delta") ||
+        !event.delta) return;
+    const now = performance.now();
+    turn.firstOutputAt ??= now;
+    turn.lastOutputAt = now;
+    if (event.type === "thinking_delta") turn.sawThinking = true;
   });
   pi.on("message_end", ({ message }) => {
     if (message.role === "assistant") recordOutputSpeed(message);
