@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
 import { mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
+import { createRequire } from "node:module";
+import { ClaudeUsageReader, type ClaudeUsageQuery } from "./lib/claude-usage.js";
 import { registerRemoteControl as installRemoteControl } from "../dist/remote/client.js";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join, resolve } from "node:path";
@@ -18,6 +20,7 @@ import {
 import {
   buildSessionContext,
   convertToLlm,
+  CONFIG_DIR_NAME,
   createReadToolDefinition,
   createReadOnlyTools,
   CustomEditor,
@@ -285,9 +288,24 @@ type SkillReference = {
   baseDir: string;
 };
 
-type StatuslineSettings = {
-  fast?: boolean;
-};
+const STATUSLINE_SOURCES = [
+  { id: "codex", provider: "openai-codex", label: "Codex quota and resets" },
+  { id: "antigravity", provider: "antigravity", label: "Antigravity quota and resets" },
+  { id: "deepseek", provider: "deepseek", label: "DeepSeek balance (USD)" },
+  { id: "claude-bridge", provider: "claude-bridge", label: "Claude Bridge quota and resets" },
+] as const;
+type StatuslineSource = typeof STATUSLINE_SOURCES[number]["id"];
+type StatuslineSettings = Record<StatuslineSource, boolean>;
+type StatuslineData = { quotas?: Quotas; balance?: number };
+
+function statuslineSource(provider: string | undefined): StatuslineSource | undefined {
+  return STATUSLINE_SOURCES.find(source => source.provider === provider)?.id;
+}
+
+export function parseStatuslineSettings(value: unknown): StatuslineSettings {
+  const settings = object(value);
+  return Object.fromEntries(STATUSLINE_SOURCES.map(({ id }) => [id, settings?.[id] !== false])) as StatuslineSettings;
+}
 
 function isNewLineShortcut(data: string): boolean {
   return matchesKey(data, Key.shift("enter")) ||
@@ -509,22 +527,32 @@ ${body}
 </skill>`;
 }
 
-async function loadFastMode(): Promise<boolean> {
+async function readSettings(): Promise<Record<string, unknown>> {
   try {
-    const settings = object(JSON.parse(await readFile(SETTINGS_PATH, "utf8"))) as
-      | StatuslineSettings
-      | undefined;
-    return settings?.fast === true;
-  } catch {
-    return false;
+    const settings = object(JSON.parse(await readFile(SETTINGS_PATH, "utf8")));
+    if (!settings) throw new Error("Expected a settings object.");
+    return settings;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+    throw error;
   }
 }
 
-async function saveFastMode(enabled: boolean): Promise<void> {
-  await mkdir(dirname(SETTINGS_PATH), { recursive: true });
-  const temporaryPath = `${SETTINGS_PATH}.${process.pid}.tmp`;
-  await writeFile(temporaryPath, `${JSON.stringify({ fast: enabled }, null, 2)}\n`, "utf8");
-  await rename(temporaryPath, SETTINGS_PATH);
+async function saveSettings(patch: { fast?: boolean; statusline?: Partial<StatuslineSettings> }): Promise<void> {
+  await withFileMutationQueue(SETTINGS_PATH, async () => {
+    const previous = await readSettings(); // Never overwrite unreadable or malformed settings.
+    const settings = { ...previous, ...patch,
+      ...(patch.statusline ? { statusline: { ...object(previous.statusline), ...patch.statusline } } : {}),
+    };
+    await mkdir(dirname(SETTINGS_PATH), { recursive: true });
+    const temporaryPath = `${SETTINGS_PATH}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      await writeFile(temporaryPath, `${JSON.stringify(settings, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+      await rename(temporaryPath, SETTINGS_PATH);
+    } finally {
+      await rm(temporaryPath, { force: true });
+    }
+  });
 }
 
 function isCodexModel(ctx: ExtensionContext): boolean {
@@ -669,6 +697,34 @@ function selectAntigravityQuotas(
       : groups.find((group) => !group.searchableName.includes("gemini"))?.quotas);
 }
 
+export function parseDeepSeekBalance(value: unknown): number | undefined {
+  const infos = object(value)?.balance_infos;
+  if (!Array.isArray(infos)) return undefined;
+  for (const info of infos) {
+    const balance = object(info);
+    if (balance?.currency !== "USD") continue;
+    const amount = finiteNumber(balance.total_balance);
+    if (amount !== undefined) return amount;
+  }
+  // Never relabel a CNY balance as USD or invent an exchange rate.
+  return undefined;
+}
+
+export function parseClaudeBridgeQuotas(value: unknown): Quotas | undefined {
+  const payload = object(value);
+  if (payload?.rate_limits_available !== true) return undefined;
+  const limits = object(payload.rate_limits);
+  const quotas: Quotas = {};
+  for (const [source, target] of [["five_hour", "fiveHour"], ["seven_day", "weekly"]] as const) {
+    const window = object(limits?.[source]);
+    const used = finiteNumber(window?.utilization);
+    if (!window || used === undefined || used < 0 || used > 100) continue;
+    const resetAt = typeof window.resets_at === "string" ? Date.parse(window.resets_at) : NaN;
+    quotas[target] = { remaining: 100 - used, resetAt: Number.isFinite(resetAt) ? resetAt : undefined };
+  }
+  return quotas.fiveHour || quotas.weekly ? quotas : undefined;
+}
+
 function formatReset(resetAt: number | undefined, now = Date.now()): string {
   if (resetAt === undefined) return "";
   const minutes = Math.max(0, Math.ceil((resetAt - now) / 60_000));
@@ -687,7 +743,7 @@ function quotaText(label: string, quota: QuotaWindow | undefined, compact: boole
   if (!quota) return `${label} -`;
   const percent = Math.round(quota.remaining);
   return compact
-    ? `${label} ${percent}%`
+    ? `${label} ${percent}%${formatReset(quota.resetAt)}`
     : `${label} ${percent}% left${formatReset(quota.resetAt)}`;
 }
 
@@ -741,20 +797,17 @@ async function resolveCodexHeaders(
   return undefined;
 }
 
-async function fetchCodexQuotas(ctx: ExtensionContext): Promise<CodexQuotaData | undefined> {
-  const headers = await resolveCodexHeaders(ctx);
-  if (!headers) return undefined;
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
+async function fetchCodexQuotas(ctx: ExtensionContext, signal: AbortSignal): Promise<CodexQuotaData | undefined> {
   try {
-    const response = await fetch(CODEX_USAGE_URL, { headers, signal: controller.signal });
+    const headers = await resolveCodexHeaders(ctx);
+    if (!headers || signal.aborted) return undefined;
+    const response = await fetch(CODEX_USAGE_URL, {
+      headers, signal: AbortSignal.any([signal, AbortSignal.timeout(TIMEOUT_MS)]), redirect: "error",
+    });
     if (!response.ok) return undefined;
     return parseCodexQuotaData(await response.json());
   } catch {
     return undefined;
-  } finally {
-    clearTimeout(timeout);
   }
 }
 
@@ -794,30 +847,78 @@ function antigravityHeaders(token: string): Record<string, string> {
 
 async function fetchAntigravityQuotas(
   ctx: ExtensionContext,
+  signal: AbortSignal,
 ): Promise<AntigravityQuotaGroup[] | undefined> {
   const credentials = await resolveAntigravityCredentials(ctx);
   if (!credentials) return undefined;
 
   for (const endpoint of ANTIGRAVITY_ENDPOINTS) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
+    if (signal.aborted) return undefined;
     try {
       const response = await fetch(`${endpoint}/v1internal:retrieveUserQuotaSummary`, {
         method: "POST",
         headers: antigravityHeaders(credentials.token),
         body: JSON.stringify({}),
-        signal: controller.signal,
+        signal: AbortSignal.any([signal, AbortSignal.timeout(TIMEOUT_MS)]),
+        redirect: "error",
       });
       if (!response.ok) continue;
       const groups = parseAntigravityQuotaGroups(await response.json());
       if (groups.length > 0) return groups;
     } catch {
-      // Try the next Antigravity endpoint.
-    } finally {
-      clearTimeout(timeout);
+      // Try the next Antigravity endpoint unless this display was disabled.
     }
   }
   return undefined;
+}
+
+export async function fetchDeepSeekBalance(ctx: ExtensionContext, signal: AbortSignal): Promise<number | undefined> {
+  try {
+    const model = ctx.model;
+    if (!model || model.provider !== "deepseek" || signal.aborted) return undefined;
+    const base = new URL(model.baseUrl);
+    if (base.origin !== "https://api.deepseek.com" || base.username || base.password) return undefined;
+    const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+    if (!auth.ok || signal.aborted) return undefined;
+    const headers = new Headers();
+    for (const [name, value] of Object.entries(auth.headers ?? {})) {
+      if (value !== null) headers.set(name, value);
+    }
+    if (!headers.has("authorization") && auth.apiKey) headers.set("Authorization", `Bearer ${auth.apiKey}`);
+    if (!headers.has("authorization")) return undefined;
+    const response = await fetch("https://api.deepseek.com/user/balance", {
+      headers, signal: AbortSignal.any([signal, AbortSignal.timeout(TIMEOUT_MS)]), redirect: "error",
+    });
+    return response.ok ? parseDeepSeekBalance(await response.json()) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function startClaudeUsageQuery(
+  cwd: string, prompt: AsyncIterable<never>, controller: AbortController,
+): Promise<ClaudeUsageQuery> {
+  // Resolve the SDK from the installed bridge, without making it a required dependency.
+  const require = createRequire(resolveDependency("pi-claude-bridge", "package.json"));
+  const sdk = await import(pathToFileURL(require.resolve("@anthropic-ai/claude-agent-sdk")).href);
+  const configs = await Promise.all([join(AGENT_DIR, "claude-bridge.json"), join(cwd, CONFIG_DIR_NAME, "claude-bridge.json")]
+    .map(async path => {
+      try { return object(object(JSON.parse(await readFile(path, "utf8")))?.provider); }
+      catch { return undefined; }
+    }));
+  const provider = { ...configs[0], ...configs[1] };
+  controller.signal.throwIfAborted();
+  return sdk.query({
+    prompt,
+    options: {
+      cwd, abortController: controller, tools: [], mcpServers: {}, strictMcpConfig: true,
+      settingSources: [], persistSession: false, permissionMode: "dontAsk",
+      settings: { disableAllHooks: true, autoMemoryEnabled: false },
+      env: { ...process.env, ENABLE_CLAUDEAI_MCP_SERVERS: "0" },
+      ...(typeof provider.pathToClaudeCodeExecutable === "string" && provider.pathToClaudeCodeExecutable
+        ? { pathToClaudeCodeExecutable: provider.pathToClaudeCodeExecutable } : {}),
+    },
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1683,19 +1784,25 @@ export default function codexIsh(pi: ExtensionAPI) {
   registerCodexImages(pi);
   const remoteControl = registerRemoteControl(pi);
   let fastEnabled = false;
-  let codexQuotaState: QuotaState<CodexQuotaData> = { kind: "loading" };
-  let antigravityQuotaState: QuotaState<AntigravityQuotaGroup[]> = { kind: "loading" };
+  let statuslineSettings = parseStatuslineSettings(undefined);
+  let quotaState: QuotaState<StatuslineData> = { kind: "loading" };
   let refreshTimer: Timer | undefined;
+  let refreshController: AbortController | undefined;
   let tickTimer: Timer | undefined;
-  let stopped = false;
+  let stopped = true;
   let requestRender: (() => void) | undefined;
   let previousEditorFactory: EditorFactory | undefined;
   const skillBlockCache = new Map<string, Promise<string | undefined>>();
   const reportedSkillErrors = new Set<string>();
-  const clearTimers = () => {
+  const stopRefresh = () => {
+    refreshController?.abort();
+    refreshController = undefined;
     if (refreshTimer) clearTimeout(refreshTimer);
-    if (tickTimer) clearTimeout(tickTimer);
     refreshTimer = undefined;
+  };
+  const clearTimers = () => {
+    stopRefresh();
+    if (tickTimer) clearTimeout(tickTimer);
     tickTimer = undefined;
   };
 
@@ -1708,19 +1815,47 @@ export default function codexIsh(pi: ExtensionAPI) {
     tickTimer.unref?.();
   };
 
-  const refresh = async (ctx: ExtensionContext) => {
-    const [codex, antigravity] = await Promise.all([
-      fetchCodexQuotas(ctx),
-      fetchAntigravityQuotas(ctx),
-    ]);
-    if (stopped) return;
-    codexQuotaState = codex ? { kind: "ready", data: codex } : { kind: "unavailable" };
-    antigravityQuotaState = antigravity
-      ? { kind: "ready", data: antigravity }
-      : { kind: "unavailable" };
+  const restartRefresh = (ctx: ExtensionContext) => {
+    stopRefresh();
+    quotaState = { kind: "loading" };
     requestRender?.();
-    refreshTimer = setTimeout(() => void refresh(ctx), REFRESH_MS) as Timer;
-    refreshTimer.unref?.();
+    const model = ctx.model;
+    const source = statuslineSource(model?.provider);
+    if (stopped || ctx.mode !== "tui" || !model || !source || !statuslineSettings[source]) return;
+    const controller = refreshController = new AbortController();
+    const { signal } = controller;
+    const claude = source === "claude-bridge"
+      ? new ClaudeUsageReader((prompt, abort) => startClaudeUsageQuery(ctx.cwd, prompt, abort), signal)
+      : undefined;
+    const refresh = async () => {
+      let data: StatuslineData | undefined;
+      try {
+        if (source === "deepseek") {
+          const balance = await fetchDeepSeekBalance(ctx, signal);
+          if (balance !== undefined) data = { balance };
+        } else {
+          let quotas: Quotas | undefined;
+          if (source === "codex") {
+            const result = await fetchCodexQuotas(ctx, signal);
+            if (result) quotas = selectCodexQuotas(result, model.id);
+          } else if (source === "antigravity") {
+            const result = await fetchAntigravityQuotas(ctx, signal);
+            if (result) quotas = selectAntigravityQuotas(result, model.id);
+          } else if (claude) {
+            quotas = parseClaudeBridgeQuotas(await claude.read());
+            if (!quotas) claude.close();
+          }
+          if (quotas) data = { quotas };
+        }
+      } catch { /* Missing credentials or provider errors must not break the footer. */ }
+      // An old provider/session must never publish data or restart its timer.
+      if (signal.aborted || stopped) return;
+      quotaState = data ? { kind: "ready", data } : { kind: "unavailable" };
+      requestRender?.();
+      refreshTimer = setTimeout(() => void refresh(), REFRESH_MS) as Timer;
+      refreshTimer.unref?.();
+    };
+    void refresh();
   };
 
   pi.on("context", async (event, ctx) => {
@@ -1776,7 +1911,7 @@ export default function codexIsh(pi: ExtensionAPI) {
   });
 
   const redraw = () => requestRender?.();
-  pi.on("model_select", redraw);
+  pi.on("model_select", (_event, ctx) => restartRefresh(ctx));
   pi.on("thinking_level_select", redraw);
   pi.on("message_end", redraw);
   pi.on("turn_end", redraw);
@@ -2013,6 +2148,57 @@ export default function codexIsh(pi: ExtensionAPI) {
   pi.registerCommand("btw", sideCommand);
   pi.registerCommand("side", sideCommand);
 
+  pi.registerCommand("statusline", {
+    description: "Choose which providers show quota or balance in the statusline",
+    getArgumentCompletions: prefix => {
+      const values = ["status", ...STATUSLINE_SOURCES.flatMap(({ id }) => [id, `${id} on`, `${id} off`])];
+      const matches = values.filter(value => value.startsWith(prefix.trimStart().toLowerCase()))
+        .map(value => ({ value, label: value }));
+      return matches.length ? matches : null;
+    },
+    handler: async (args, ctx) => {
+      const setVisible = async (source: StatuslineSource, enabled: boolean): Promise<boolean> => {
+        try { await saveSettings({ statusline: { [source]: enabled } }); }
+        catch {
+          ctx.ui.notify("Unable to save statusline settings. Check codex-ish.json and the Pi config directory, then try again.", "error");
+          return false;
+        }
+        statuslineSettings[source] = enabled;
+        if (statuslineSource(ctx.model?.provider) === source) restartRefresh(ctx);
+        return true;
+      };
+      const action = args.trim().toLowerCase();
+      if (action === "status") {
+        ctx.ui.notify(`Only the current provider is shown.\n${STATUSLINE_SOURCES.map(({ id, label }) =>
+          `${label}: ${statuslineSettings[id] ? "on" : "off"}`).join("\n")}`, "info");
+        return;
+      }
+      if (action) {
+        const [id, value, extra] = action.split(/\s+/);
+        const source = STATUSLINE_SOURCES.find(source => source.id === id || source.provider === id);
+        if (!source || extra || value && value !== "on" && value !== "off") {
+          ctx.ui.notify("Use /statusline, /statusline status, or /statusline <codex|antigravity|deepseek|claude-bridge> [on|off].", "warning");
+          return;
+        }
+        const enabled = value ? value === "on" : !statuslineSettings[source.id];
+        if (await setVisible(source.id, enabled)) ctx.ui.notify(`${source.label}: ${enabled ? "on" : "off"}.`, "info");
+        return;
+      }
+      if (!ctx.hasUI) {
+        ctx.ui.notify("Use /statusline <codex|antigravity|deepseek|claude-bridge> on|off without interactive mode.", "warning");
+        return;
+      }
+      for (;;) {
+        const choices = STATUSLINE_SOURCES.map(({ id, label }) => `${label}: ${statuslineSettings[id] ? "on" : "off"}`);
+        const selected = await ctx.ui.select("Statusline — select to toggle; only the current provider is shown", [...choices, "Done"]);
+        const index = selected === undefined ? -1 : choices.indexOf(selected);
+        if (index < 0) return;
+        const { id } = STATUSLINE_SOURCES[index]!;
+        if (!await setVisible(id, !statuslineSettings[id])) return;
+      }
+    },
+  });
+
   pi.registerCommand("fast", {
     description: "Toggle Codex fast mode",
     getArgumentCompletions: (prefix) => {
@@ -2040,7 +2226,7 @@ export default function codexIsh(pi: ExtensionAPI) {
 
       const next = action === "on" ? true : action === "off" ? false : !fastEnabled;
       try {
-        await saveFastMode(next);
+        await saveSettings({ fast: next });
       } catch {
         ctx.ui.notify("Unable to save fast mode. Check the Pi config directory and try again.", "error");
         return;
@@ -2062,9 +2248,10 @@ export default function codexIsh(pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     stopped = false;
     clearTimers();
-    codexQuotaState = { kind: "loading" };
-    antigravityQuotaState = { kind: "loading" };
-    fastEnabled = await loadFastMode();
+    quotaState = { kind: "loading" };
+    const settings = await readSettings().catch(() => ({} as Record<string, unknown>));
+    fastEnabled = settings.fast === true;
+    statuslineSettings = parseStatuslineSettings(settings.statusline);
 
     if (ctx.mode !== "tui") return;
 
@@ -2138,27 +2325,21 @@ export default function codexIsh(pi: ExtensionAPI) {
             CODEX_STATUS_COLORS.context,
           );
 
-          const provider = ctx.model?.provider;
-          const modelId = ctx.model?.id ?? "";
-          const quotaState = provider === "openai-codex"
-            ? codexQuotaState
-            : provider === "antigravity"
-              ? antigravityQuotaState
-              : undefined;
-          const quotas = provider === "openai-codex" && codexQuotaState.kind === "ready"
-            ? selectCodexQuotas(codexQuotaState.data, modelId)
-            : provider === "antigravity" && antigravityQuotaState.kind === "ready"
-              ? selectAntigravityQuotas(antigravityQuotaState.data, modelId)
-              : undefined;
-          const fiveHour = quotas?.fiveHour;
-          const weekly = quotas?.weekly;
-
+          const source = statuslineSource(ctx.model?.provider);
+          const quotas = quotaState.kind === "ready" ? quotaState.data.quotas : undefined;
           const quotaValue = (label: string, quota: QuotaWindow | undefined, compact: boolean) => {
-            if (quotaState?.kind === "loading") return theme.fg("dim", `${label} …`);
+            if (quotaState.kind === "loading") return theme.fg("dim", `${label} …`);
             const text = quotaText(label, quota, compact);
-            return quota
-              ? paint(text, CODEX_STATUS_COLORS.quota)
-              : theme.fg("dim", text);
+            return quota ? paint(text, CODEX_STATUS_COLORS.quota) : theme.fg("dim", text);
+          };
+          const quotaParts = (compact: boolean, weeklyLabel: string): string[] => {
+            if (!source || !statuslineSettings[source]) return [];
+            if (source === "deepseek") {
+              const balance = quotaState.kind === "ready" ? quotaState.data.balance : undefined;
+              if (balance !== undefined) return [paint(`USD ${balance.toFixed(2)}${compact ? "" : " left"}`, CODEX_STATUS_COLORS.quota)];
+              return [theme.fg("dim", `USD ${quotaState.kind === "loading" ? "…" : "n/a"}`)];
+            }
+            return [quotaValue("5h", quotas?.fiveHour, compact), quotaValue(weeklyLabel, quotas?.weekly, compact)];
           };
 
           const full = [
@@ -2166,8 +2347,7 @@ export default function codexIsh(pi: ExtensionAPI) {
             providerFull,
             remoteFull,
             contextFull,
-            quotaValue("5h", fiveHour, false),
-            quotaValue("weekly", weekly, false),
+            ...quotaParts(false, "weekly"),
             ...contextTokens,
           ].join(separator);
           if (visibleWidth(full) <= width) return [full];
@@ -2177,8 +2357,7 @@ export default function codexIsh(pi: ExtensionAPI) {
             providerFull,
             remoteFull,
             contextShort,
-            quotaValue("5h", fiveHour, true),
-            quotaValue("week", weekly, true),
+            ...quotaParts(true, "week"),
             ...contextTokens,
           ].join(separator);
           if (visibleWidth(medium) <= width) return [medium];
@@ -2188,8 +2367,7 @@ export default function codexIsh(pi: ExtensionAPI) {
             providerFull,
             remoteFull,
             contextShort,
-            quotaValue("5h", fiveHour, true),
-            quotaValue("wk", weekly, true),
+            ...quotaParts(true, "wk"),
             ...contextTokens,
           ].join(separator);
           return [truncateToWidth(narrow, width, "…")];
@@ -2198,7 +2376,7 @@ export default function codexIsh(pi: ExtensionAPI) {
     });
 
     scheduleTick();
-    void refresh(ctx);
+    restartRefresh(ctx);
   });
 
   pi.on("session_shutdown", (_event, ctx) => {

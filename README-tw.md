@@ -45,7 +45,10 @@ pi install git:github.com/yanun0323/codex-ish
 
 - **Codex**：5 小時與每週剩餘百分比，附重置倒數（`gpt-5.3-codex-spark` 有獨立額度）。
 - **Antigravity（Google）**：依模型家族分組的額度。
-- 每 60 秒更新一次；顏色會自動適應 truecolor 或 ANSI-256 終端機。
+- **DeepSeek API**：使用目前模型在 Pi 的憑證，顯示 USD 剩餘額度。只支援官方 `api.deepseek.com`；若沒有 USD 餘額，顯示 `n/a`，不會自行換算人民幣。
+- **Claude Bridge（`pi-claude-bridge`）**：透過 bridge 已安裝的 Claude Agent SDK 與 Claude Code 登入，顯示 5 小時與每週剩餘百分比、重置倒數。背景輔助程序只查額度，不發送模型提示，也不掃描對話紀錄。SDK 的額度介面仍屬實驗功能；版本或登入方式不支援時顯示 `-`，必要時請更新 bridge 並執行 `/reload`。
+- 只顯示、查詢**目前使用的 provider**。四個來源預設皆開啟；用 `/statusline` 選單分別開關，或執行 `/statusline <codex|antigravity|deepseek|claude-bridge> on|off`；`/statusline status` 可查看已儲存的選項。
+- 開啟時每 60 秒更新；關閉顯示、切換模型或結束工作階段時，會取消查詢並關閉 Claude 輔助程序。精簡顯示仍保留重置倒數；顏色會自動適應 truecolor 或 ANSI-256 終端機。
 
 ### ChatGPT Remote Control（`/remote`）
 
@@ -89,6 +92,7 @@ pi install git:github.com/yanun0323/codex-ish
 | 設定 | 位置 | 說明 |
 |---|---|---|
 | 快速模式 | `~/.pi/agent/codex-ish.json` | 由 `/fast` 寫入 |
+| 狀態列 provider 顯示 | `~/.pi/agent/codex-ish.json` 的 `statusline` | 由 `/statusline` 寫入，不影響 `/fast` |
 | Remote 服務目錄 | `~/.pi/agent/codex-ish-remote/` | 可用 `PI_CODEX_ISH_REMOTE_HOME` 覆寫；請保持目錄私密 |
 | Remote 自動啟動 | 環境變數 | `PI_CODEX_APP_SERVER_AUTOSTART=0` 停用 |
 | Remote 本機連線 | Remote 目錄內的 `host.sock` | 私人 Unix socket；不再使用 `PI_CODEX_APP_SERVER_LISTEN` |

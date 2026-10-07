@@ -45,7 +45,10 @@ Custom footer with model, provider, remote-control state, context usage, and liv
 
 - **Codex**: 5-hour and weekly remaining percentage with reset countdown (including a separate limit for `gpt-5.3-codex-spark`).
 - **Antigravity (Google)**: per-model-family quota groups.
-- Refreshes every 60 seconds; colors adapt to truecolor or ANSI-256 terminals.
+- **DeepSeek API**: remaining USD balance using the selected model's Pi credentials. Only the official `api.deepseek.com` endpoint is supported; missing USD balances show `n/a`, not a converted CNY amount.
+- **Claude Bridge (`pi-claude-bridge`)**: 5-hour and weekly remaining percentage with reset countdown, using the bridge's installed Claude Agent SDK and Claude Code login. An idle helper process reads usage without sending model prompts or scanning transcripts. The SDK usage API is experimental; unsupported versions/logins show `-`. Update the bridge and `/reload` if needed.
+- Only the **current provider** is shown and queried. All four displays default to on. Open `/statusline` to toggle each one, or use `/statusline <codex|antigravity|deepseek|claude-bridge> on|off`; `/statusline status` lists the saved choices.
+- Refreshes every 60 seconds while enabled; disabling a display, switching models, or closing the session cancels its queries and closes the Claude helper. Reset countdowns remain in compact layouts; colors adapt to truecolor or ANSI-256 terminals.
 
 ### ChatGPT Remote Control (`/remote`)
 
@@ -89,6 +92,7 @@ Opens an in-memory, read-only side chat using the main conversation as reference
 | Setting | Location | Notes |
 |---|---|---|
 | Fast mode | `~/.pi/agent/codex-ish.json` | Written by `/fast` |
+| Statusline provider displays | `statusline` in `~/.pi/agent/codex-ish.json` | Written by `/statusline`; independent of `/fast` |
 | Remote daemon home | `~/.pi/agent/codex-ish-remote/` | Override with `PI_CODEX_ISH_REMOTE_HOME`; keep this directory private |
 | Remote autostart | env | `PI_CODEX_APP_SERVER_AUTOSTART=0` disables |
 | Remote local connection | `host.sock` inside the Remote home | Private Unix socket; `PI_CODEX_APP_SERVER_LISTEN` is no longer used |
