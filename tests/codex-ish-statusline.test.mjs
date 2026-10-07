@@ -57,7 +57,7 @@ const { ClaudeUsageReader, CLAUDE_USAGE_METHOD } = await jiti.import(resolve(her
 const { visibleWidth, getKeybindings } = await import(join(piRoot, "node_modules/@earendil-works/pi-tui/dist/index.js"));
 const { initTheme } = await import(join(piRoot, "dist/modes/interactive/theme/theme.js"));
 initTheme("dark", false);
-const fieldIds = ["model-with-thinking", "provider", "remote", "context-used-percentage", "quota-reset", "context-used-tokens", "context-window-tokens", "output-speed", "output-speed-avg5"];
+const fieldIds = ["model-with-thinking", "provider", "git-branch", "remote", "context-used-percentage", "quota-reset", "context-used-tokens", "context-window-tokens", "output-speed", "output-speed-avg5"];
 const fieldSettings = enabled => Object.fromEntries(fieldIds.map(id => [id, enabled]));
 const settingsPath = join(agentDir, "codex-ish.json");
 const writeSettings = settings => writeFile(settingsPath, JSON.stringify(settings));
@@ -106,6 +106,13 @@ async function fixture(t, provider = "deepseek", mode = "tui") {
   let footer;
   let menu;
   let redraws = 0;
+  let gitBranch = "main";
+  let branchReads = 0;
+  const branchListeners = new Set();
+  const footerData = {
+    getGitBranch() { branchReads++; return gitBranch; },
+    onBranchChange(callback) { branchListeners.add(callback); return () => branchListeners.delete(callback); },
+  };
   const notifications = [];
   const authCalls = [];
   const theme = { fg: (_color, text) => text, bold: text => text, getColorMode: () => "truecolor" };
@@ -121,7 +128,10 @@ async function fixture(t, provider = "deepseek", mode = "tui") {
     ui: {
       notify: (message, level) => notifications.push({ message, level }), setWidget() {},
       getEditorComponent() {}, setEditorComponent() {}, addAutocompleteProvider() {}, getEditorText: () => "",
-      setFooter(factory) { footer = factory?.({ requestRender() { redraws++; } }, theme); },
+      setFooter(factory) {
+        footer?.dispose?.();
+        footer = factory?.({ requestRender() { redraws++; } }, theme, footerData);
+      },
       select: async () => { throw new Error("Statusline should use a checkbox list, not a select dialog"); },
       custom: factory => new Promise(done => {
         menu = factory({ terminal: { rows: 24 }, requestRender() { redraws++; } }, theme, getKeybindings(), () => {
@@ -140,6 +150,9 @@ async function fixture(t, provider = "deepseek", mode = "tui") {
     get menu() { return menu; },
     renderMenu: (width = 80) => stripVTControlCharacters(menu?.render(width).join("\n") ?? ""),
     get redraws() { return redraws; },
+    get branchReads() { return branchReads; },
+    get branchListenerCount() { return branchListeners.size; },
+    changeBranch(branch) { gitBranch = branch; for (const callback of branchListeners) callback(); },
     switch: async (provider, id) => {
       const previousModel = ctx.model;
       ctx.model = model(provider);
@@ -267,7 +280,7 @@ test("Claude usage converts documented percentages (not fractions) and ISO reset
     { weekly: { remaining: 0, resetAt: undefined } });
 });
 
-test("nine field switches default to on, use explicit false, and ignore old provider switches", () => {
+test("ten field switches default to on, use explicit false, and ignore old provider switches", () => {
   const defaults = fieldSettings(true);
   for (const value of [undefined, null, [], { fast: true }, { provider: "false", remote: 0 },
     { codex: false, antigravity: false, deepseek: false, "claude-bridge": false }]) {
@@ -384,6 +397,79 @@ test("Codex and Antigravity still show model-specific quotas and keep compact re
   assert.doesNotMatch(f.render(), /80%|USD/);
   assert.deepEqual(f.authCalls, ["openai-codex", "openai-codex", "antigravity"]);
   assert.equal(requests.length, 3);
+});
+
+test("git branch follows provider, updates from Pi, and has an independent persistent display switch", async t => {
+  const f = await fixture(t, "unsupported");
+  const clock = speedClock(t, f);
+  await clock.complete(10, 1000);
+  assert.deepEqual(f.render().split(" · ").slice(0, 4), ["test-unsupported", "unsupported", "git main", "remote worker"]);
+  const redraws = f.redraws;
+  f.changeBranch("feature/statusline");
+  assert.ok(f.redraws > redraws, "Git branch changes request a redraw without waiting for the footer timer");
+  assert.match(f.render(), /unsupported · git feature\/statusline · remote worker/);
+  assertSpeeds(f, 10); // A Git checkout is not a conversation-tree change.
+  await f.command("provider off");
+  assert.deepEqual(f.render().split(" · ").slice(0, 3), ["test-unsupported", "git feature/statusline", "remote worker"]);
+  await f.command("git-branch off");
+  const hiddenRedraws = f.redraws, hiddenReads = f.branchReads;
+  f.changeBranch("fix/updated-while-hidden");
+  assert.equal(f.redraws, hiddenRedraws);
+  assert.doesNotMatch(f.render(), /git |feature\/statusline|updated-while-hidden/);
+  assert.equal(f.branchReads, hiddenReads, "Hidden branches are not queried during render");
+  assert.deepEqual((await readSettings()).statusline, { provider: false, "git-branch": false });
+  await f.emit("session_shutdown");
+  await f.emit("session_start");
+  assert.doesNotMatch(f.render(), /git /);
+  await f.command("git-branch on");
+  assert.match(f.render(), /git fix\/updated-while-hidden · remote worker/);
+  assert.deepEqual((await readSettings()).statusline, { provider: false, "git-branch": true });
+  await f.command("status");
+  assert.match(f.notifications.at(-1).message, /git-branch\s+\[X\]/);
+  assert.deepEqual(f.commands.get("statusline").getArgumentCompletions("git-branch ").map(item => item.value), ["git-branch on", "git-branch off"]);
+  assert.deepEqual(f.authCalls, []);
+});
+
+test("git branch handles no repository, detached HEAD, and long Unicode names at narrow widths", async t => {
+  await writeSettings({ statusline: { ...fieldSettings(false), "git-branch": true } });
+  const f = await fixture(t, "unsupported");
+  f.changeBranch(null);
+  assert.equal(f.render(), "git —");
+  f.changeBranch("detached");
+  assert.equal(f.render(), "git detached");
+  const branch = `feature/${"很長的分支名稱-".repeat(40)}`;
+  f.changeBranch(branch);
+  assert.equal(f.render(1000), `git ${branch}`);
+  for (const mode of ["truecolor", "256color"]) {
+    f.theme.getColorMode = () => mode;
+    for (const width of [1, 10, 24, 40, 80]) {
+      for (const line of f.raw(width)) assert.ok(visibleWidth(line) <= width);
+      assert.doesNotMatch(f.render(width), /·/);
+    }
+  }
+  await f.command("git-branch off");
+  assert.deepEqual(f.raw(500), []);
+});
+
+test("git branch subscriptions are released when replacing the footer or closing the session", async t => {
+  const f = await fixture(t, "unsupported");
+  assert.equal(f.branchListenerCount, 1);
+  await f.emit("session_start");
+  assert.equal(f.branchListenerCount, 1, "Replacing the footer unsubscribes the old listener");
+  f.ctx.ui.setFooter(undefined);
+  assert.equal(f.branchListenerCount, 0);
+  let redraws = f.redraws;
+  f.changeBranch("after-dispose");
+  assert.equal(f.redraws, redraws);
+  await f.emit("session_start");
+  assert.equal(f.branchListenerCount, 1);
+  assert.match(f.render(), /git after-dispose/);
+  await f.emit("session_shutdown");
+  await f.emit("session_shutdown");
+  assert.equal(f.branchListenerCount, 0);
+  redraws = f.redraws;
+  f.changeBranch("after-shutdown");
+  assert.equal(f.redraws, redraws);
 });
 
 test("completed response speeds include initial wait and thinking, exclude tools and idle time, and follow context-window", async t => {
@@ -585,7 +671,7 @@ test("field switches persist across reload, preserve /fast, and replace obsolete
   assert.equal((await readdir(agentDir)).some(name => name.endsWith(".tmp")), false);
 });
 
-test("/statusline is a nine-field checkbox menu with aligned values and keyboard toggles", async t => {
+test("/statusline is a ten-field checkbox menu with aligned values and keyboard toggles", async t => {
   const f = await fixture(t, "unsupported");
   const opened = f.command("");
   const lines = f.renderMenu().split("\n").filter(line => line.includes("[X]"));
@@ -661,20 +747,21 @@ test("checkbox menu supports mouse input and narrow widths without hiding its ch
     for (const line of lines) assert.ok(visibleWidth(line) <= width);
     if (width >= 10) assert.equal(stripVTControlCharacters(lines.join("\n")).match(/\[X\]/g)?.length, fieldIds.length);
   }
-  f.menu.handleMouse({ type: "press", button: "left", x: 3, y: 4 });
-  f.menu.handleMouse({ type: "click", button: "left", x: 3, y: 4 });
+  const remoteRow = 2 + fieldIds.indexOf("remote");
+  f.menu.handleMouse({ type: "press", button: "left", x: 3, y: remoteRow });
+  f.menu.handleMouse({ type: "click", button: "left", x: 3, y: remoteRow });
   await eventually(() => !f.renderMenu().includes("Saving…"));
   assert.doesNotMatch(f.render(), /remote/);
   f.menu.handleInput("\x1b"); await opened;
   assert.deepEqual((await readSettings()).statusline, { remote: false });
 });
 
-test("each of the nine fields can be the only visible field, and all-off leaves no footer", async t => {
+test("each of the ten fields can be the only visible field, and all-off leaves no footer", async t => {
   await writeSettings({ statusline: fieldSettings(false) });
   const requests = t.mock.method(globalThis, "fetch", async () => Response.json(balancePayload("12.34")));
   const f = await fixture(t);
   f.ctx.model.id = "model-fixture"; f.ctx.thinkingLevel = "high";
-  const expected = ["model-fixture high", "deepseek", "remote worker", "8% context used", "USD 12.34 left", "10K used", "128K window", "last — tok/s", "avg5 — tok/s"];
+  const expected = ["model-fixture high", "deepseek", "git main", "remote worker", "8% context used", "USD 12.34 left", "10K used", "128K window", "last — tok/s", "avg5 — tok/s"];
   assert.deepEqual(f.raw(500), []); assert.equal(requests.mock.callCount(), 0);
   for (const [index, id] of fieldIds.entries()) {
     await f.command(`${id} on`);
@@ -702,8 +789,8 @@ test("hiding individual fields neither changes fast mode nor restarts quota poll
   await eventually(() => f.render().includes("5h 70%"));
   assert.match(f.render(), /test-openai-codex high fast/);
   const full = f.render().split(" · ");
-  for (const [id, text] of [["model-with-thinking", full[0]], ["provider", full[1]], ["remote", full[2]],
-    ["context-used-percentage", full[3]], ["context-used-tokens", full.at(-4)], ["context-window-tokens", full.at(-3)],
+  for (const [id, text] of [["model-with-thinking", full[0]], ["provider", full[1]], ["git-branch", full[2]], ["remote", full[3]],
+    ["context-used-percentage", full[4]], ["context-used-tokens", full.at(-4)], ["context-window-tokens", full.at(-3)],
     ["output-speed", full.at(-2)], ["output-speed-avg5", full.at(-1)]]) {
     await f.command(`${id} off`);
     assert.deepEqual(f.render().split(" · "), full.filter(part => part !== text));
@@ -811,6 +898,7 @@ test("non-TUI sessions never fetch usage, but direct statusline commands still s
     await f.command("quota-reset off");
     await f.switch("deepseek");
     assert.equal(f.authCalls.length, 0); assert.equal(f.render(), "");
+    assert.equal(f.branchListenerCount, 0); assert.equal(f.branchReads, 0);
     assert.equal((await readSettings()).statusline["quota-reset"], false);
     await f.command(""); assert.equal(f.notifications.at(-1).level, "warning");
     assert.equal(f.menu, undefined);

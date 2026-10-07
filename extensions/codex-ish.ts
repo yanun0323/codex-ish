@@ -299,6 +299,7 @@ const STATUSLINE_SOURCES = [
 const STATUSLINE_ITEMS = [
   "model-with-thinking",
   "provider",
+  "git-branch",
   "remote",
   "context-used-percentage",
   "quota-reset",
@@ -2388,13 +2389,18 @@ export default function codexIsh(pi: ExtensionAPI) {
       )
     );
 
-    ctx.ui.setFooter((tui, theme) => {
-      requestRender = () => tui.requestRender();
+    ctx.ui.setFooter((tui, theme, footerData) => {
+      const renderFooter = () => tui.requestRender();
+      requestRender = renderFooter;
+      const unsubscribeBranch = footerData.onBranchChange(() => {
+        if (statuslineSettings["git-branch"]) renderFooter();
+      });
 
       return {
         invalidate() {},
         dispose() {
-          requestRender = undefined;
+          unsubscribeBranch();
+          if (requestRender === renderFooter) requestRender = undefined;
         },
         render(width: number): string[] {
           if (!ctx.isIdle() && ctx.ui.getEditorText().trim()) {
@@ -2420,6 +2426,10 @@ export default function codexIsh(pi: ExtensionAPI) {
             ctx.model?.provider ?? "no provider",
             CODEX_STATUS_COLORS.metadata,
           );
+          const branch = statuslineSettings["git-branch"] ? footerData.getGitBranch() : null;
+          const gitBranch = branch
+            ? paint(`git ${branch}`, CODEX_STATUS_COLORS.metadata)
+            : theme.fg("dim", "git —");
           const remoteFull = paint(remoteControl.footerText(), CODEX_STATUS_COLORS.metadata);
 
           const usage = ctx.getContextUsage();
@@ -2474,6 +2484,7 @@ export default function codexIsh(pi: ExtensionAPI) {
             const fields: Array<[StatuslineItem, string[]]> = [
               ["model-with-thinking", [modelFull]],
               ["provider", [providerFull]],
+              ["git-branch", [gitBranch]],
               ["remote", [remoteFull]],
               ["context-used-percentage", [compact ? contextShort : contextFull]],
               ["quota-reset", quotaParts(compact, weeklyLabel)],

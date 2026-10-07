@@ -41,14 +41,15 @@ pi install git:github.com/yanun0323/codex-ish
 
 ### ステータスライン（フッター）
 
-モデル、プロバイダー、リモート制御の状態、コンテキスト使用量、リアルタイムの quota、応答速度を表示するカスタムフッターです。
+モデル、プロバイダー、Git ブランチ、リモート制御の状態、コンテキスト使用量、リアルタイムの quota、応答速度を表示するカスタムフッターです。
 
 - **Codex**：5 時間と週単位の残り率をリセットカウントダウン付きで表示（`gpt-5.3-codex-spark` は別の上限）。
 - **Antigravity（Google）**：モデルファミリー別の quota グループ。
 - **DeepSeek API**：選択中のモデルの Pi 認証情報で USD 残高を表示します。公式の `api.deepseek.com` のみ対応し、USD 残高がなければ `n/a` を表示します。人民元からの換算はしません。
 - **Claude Bridge（`pi-claude-bridge`）**：bridge にインストールされた Claude Agent SDK と Claude Code のログインを使い、5 時間・週単位の残り率とリセットまでの時間を表示します。待機中の補助プロセスが使用量だけを読み取り、モデルへのプロンプト送信や会話履歴の走査は行いません。SDK の使用量 API は実験的機能のため、非対応のバージョンやログイン方式では `-` を表示します。必要に応じて bridge を更新し、`/reload` を実行してください。
-- `/statusline` は 9 項目の独立したチェックボックスを開きます。初期状態はすべて有効です：`model-with-thinking`、`provider`、`remote`、`context-used-percentage`、`quota-reset`、`context-used-tokens`、`context-window-tokens`、`output-speed`、`output-speed-avg5`。↑/↓ で選択、Enter/Space で切り替え、Esc で閉じます。変更はその都度保存されます。`/statusline <field> on|off` でも切り替えられ、`/statusline status` で設定を確認できます。旧版のプロバイダー別スイッチは適用されません。
-- `output-speed`（`last 42.6 tok/s`）と `output-speed-avg5`（`avg5 39.8 tok/s`）は、この順で `context-window-tokens` の後に表示され、それぞれ個別に表示を切り替えられます。メインの会話でモデルの応答が完了したときだけ更新し、報告された出力トークン数（思考を含む）を、そのモデルターンの開始からの経過秒数で割って計算します。最初の待ち時間は含みますが、Pi のツール実行と待機中の時間は含みません。`avg5` は直近 5 件の有効な応答速度の算術平均で、5 件未満なら存在する件数で計算します。失敗・キャンセルした応答や、正の出力トークン数が報告されない応答は除外し、サンプルがなければ `—` を表示します。どちらの項目も非表示にしても計測は続きます。サンプルはメモリ内だけに保持し、モデル・ブランチ・セッションの切り替えや再読み込みでリセットします。
+- `/statusline` は 10 項目の独立したチェックボックスを開きます。初期状態はすべて有効です：`model-with-thinking`、`provider`、`git-branch`、`remote`、`context-used-percentage`、`quota-reset`、`context-used-tokens`、`context-window-tokens`、`output-speed`、`output-speed-avg5`。↑/↓ で選択、Enter/Space で切り替え、Esc で閉じます。変更はその都度保存されます。`/statusline <field> on|off` でも切り替えられ、`/statusline status` で設定を確認できます。旧版のプロバイダー別スイッチは適用されません。
+- `git-branch` は現在の Git ブランチ（例：`git main`）を `provider` の直後に表示し、個別に表示を切り替えられます。Pi のブランチ変更通知で自動更新します。Detached HEAD では `git detached`、ブランチを取得できない場合や Git リポジトリ外では `git —` を表示します。
+- `output-speed`（`last 42.6 tok/s`）と `output-speed-avg5`（`avg5 39.8 tok/s`）は、この順で `context-window-tokens` の後に表示され、それぞれ個別に表示を切り替えられます。メインの会話でモデルの応答が完了したときだけ更新し、報告された出力トークン数（思考を含む）を、そのモデルターンの開始からの経過秒数で割って計算します。最初の待ち時間は含みますが、Pi のツール実行と待機中の時間は含みません。`avg5` は直近 5 件の有効な応答速度の算術平均で、5 件未満なら存在する件数で計算します。失敗・キャンセルした応答や、正の出力トークン数が報告されない応答は除外し、サンプルがなければ `—` を表示します。どちらの項目も非表示にしても計測は続きます。サンプルはメモリ内だけに保持し、モデル・会話のブランチ・セッションの切り替えや再読み込みでリセットします。
 - `quota-reset` は**現在のプロバイダー**の残高、または残り率とリセットまでの時間だけを表示し、60 秒ごとに更新します。この項目を無効にしたとき、モデルの切り替え時、セッション終了時には問い合わせをキャンセルし、Claude の補助プロセスを終了します。他のチェックボックスは表示だけを切り替え、`remote` を非表示にしても Remote Control は停止しません。コンパクト表示でもリセットまでの時間を保持し、色は truecolor または ANSI-256 ターミナルに自動対応します。
 
 ### ChatGPT Remote Control（`/remote`）
